@@ -31,16 +31,22 @@ npm install
 3. Create a `.env` file in the root directory:
 ```env
 PORT=7001
-OPENROUTER_API_KEY=your_openrouter_api_key_here
-OPENROUTER_REFERER=your_app_name_or_url
 BASE_URL=http://127.0.0.1:7001
+MASTER_KEY=your_master_key_here_32_bytes_hex
 ```
+
+**Note on MASTER_KEY**: This is used to encrypt public configs (languages and API keys) for read-only access without passwords. If not set, a random key is generated on each restart, which means configs won't persist across restarts. For production, generate a secure 32-byte hex key:
+```bash
+openssl rand -hex 32
+```
+
+**Important**: Each user must configure their own OpenRouter API key in the addon's configuration page. The server does NOT provide a fallback API key.
 
 4. Get your OpenRouter API key:
    - Visit [OpenRouter](https://openrouter.ai/keys)
    - Create a new API key
-   - Add it to your `.env` file
-   - Set `OPENROUTER_REFERER` to your app name or URL (required by OpenRouter)
+   - Add it in the addon's configuration page (not in `.env`)
+   - The referer field is optional but recommended
 
 ## Usage
 
@@ -165,11 +171,27 @@ The addon automatically selects from these models (in priority order):
 - **Configuration not saving**: Check that the server is running and accessible
 - **Rate limit errors**: The addon automatically handles rate limits, but if you see errors, check your OpenRouter quota
 
+### Password Protection
+
+Each user configuration is protected with a password:
+
+1. **First Time Setup**: When you first visit the configuration page, you'll be prompted to create a password (minimum 8 characters)
+2. **Unlocking**: Each time you visit the configuration page, you'll need to enter your password to unlock and modify settings
+3. **Session**: Once unlocked, your configuration remains accessible for 30 minutes without re-entering the password
+4. **Saving Changes**: When saving configuration changes, you must re-enter your password for security
+5. **Password Recovery**: If you forget your password, you'll need to create a new configuration (old settings cannot be recovered)
+
+**Security Notes**:
+- Your password is never stored in plain text - only a secure hash (PBKDF2 with 100,000 iterations) is saved
+- Configuration files are encrypted with your password using AES-256-CBC
+- Each configuration file is independently encrypted with its own password
+- Passwords are required to modify settings, but not to use the addon (read-only access for subtitle requests)
+- Configuration files have restricted permissions (600 - owner read/write only)
+
 ## Notes
 
-- User preferences are stored in memory and will be lost on server restart
+- User configurations are stored in encrypted files in the `configs/` directory and persist across server restarts
 - Subtitle content is cached in memory for serving
-- For production use, consider implementing persistent storage for preferences and subtitle caching
 - The addon uses intelligent chunking and parallel processing for optimal translation speed
 
 ## License

@@ -4,6 +4,8 @@ const express = require('express');
 const axios = require('axios');
 const { v4: uuidv4 } = require('uuid');
 const crypto = require('crypto');
+const fs = require('fs').promises;
+const path = require('path');
 require('dotenv').config();
 
 const app = express();
@@ -20,6 +22,53 @@ app.use((req, res, next) => {
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+// Cookie parser middleware (simple implementation)
+app.use((req, res, next) => {
+  req.cookies = {};
+  if (req.headers.cookie) {
+    req.headers.cookie.split(';').forEach(cookie => {
+      const parts = cookie.trim().split('=');
+      if (parts.length === 2) {
+        req.cookies[parts[0]] = decodeURIComponent(parts[1]);
+      }
+    });
+  }
+  
+  // Add cookie setting helper
+  res.cookie = function(name, value, options = {}) {
+    let cookieString = `${name}=${encodeURIComponent(value)}`;
+    
+    if (options.maxAge) {
+      cookieString += `; Max-Age=${Math.floor(options.maxAge / 1000)}`;
+    }
+    
+    if (options.httpOnly) {
+      cookieString += '; HttpOnly';
+    }
+    
+    if (options.secure) {
+      cookieString += '; Secure';
+    }
+    
+    if (options.sameSite) {
+      cookieString += `; SameSite=${options.sameSite}`;
+    }
+    
+    if (options.path) {
+      cookieString += `; Path=${options.path}`;
+} else {
+      cookieString += '; Path=/';
+    }
+    
+    const existingCookies = res.getHeader('Set-Cookie') || [];
+    const cookieArray = Array.isArray(existingCookies) ? existingCookies : [existingCookies];
+    cookieArray.push(cookieString);
+    res.setHeader('Set-Cookie', cookieArray);
+  };
+  
+  next();
+});
 
 // Model configurations with RPM, TPM, RPD limits
 // Using OpenRouter models - supports Gemma, Llama, Claude, GPT, and more
@@ -62,27 +111,22 @@ const MODEL_CONFIGS = {
   }
 };
 
-// Initialize OpenRouter AI
-let openRouterApiKey = null;
+// Initialize OpenRouter AI model selection
+// Note: Each user must configure their own API key - no server-side fallback
 let currentModelName = null;
 let currentModelConfig = null;
 
-if (process.env.OPENROUTER_API_KEY) {
-  openRouterApiKey = process.env.OPENROUTER_API_KEY;
-  
-  // Try models in order of priority (best limits first)
-  const modelsToTry = Object.entries(MODEL_CONFIGS)
-    .sort((a, b) => a[1].priority - b[1].priority)
-    .map(([name, config]) => ({ name, ...config }));
-  
-  // Select first available model (we'll test on first request)
-  currentModelName = modelsToTry[0].name;
-  currentModelConfig = MODEL_CONFIGS[currentModelName];
-  console.log(`OpenRouter AI initialized: ${currentModelName}`);
-  console.log(`  Limits: ${currentModelConfig.rpm} RPM, ${(currentModelConfig.tpm/1000).toFixed(0)}K TPM, ${currentModelConfig.rpd} RPD`);
-} else {
-  console.warn('OPENROUTER_API_KEY not set. AI translation will not work.');
-}
+// Try models in order of priority (best limits first)
+const modelsToTry = Object.entries(MODEL_CONFIGS)
+  .sort((a, b) => a[1].priority - b[1].priority)
+  .map(([name, config]) => ({ name, ...config }));
+
+// Select first available model (we'll test on first request)
+currentModelName = modelsToTry[0].name;
+currentModelConfig = MODEL_CONFIGS[currentModelName];
+console.log(`OpenRouter AI model selection initialized: ${currentModelName}`);
+console.log(`  Limits: ${currentModelConfig.rpm} RPM, ${(currentModelConfig.tpm/1000).toFixed(0)}K TPM, ${currentModelConfig.rpd} RPD`);
+console.log(`  Note: Users must configure their own OpenRouter API key in the configuration page`);
 
 // Language code to name mapping
 const LANGUAGE_NAMES = {
@@ -214,6 +258,379 @@ function decryptConfig(encryptedData) {
 // Initialize subtitle cache
 if (!global.subtitleCache) {
   global.subtitleCache = {};
+}
+
+// ============================================================================
+// Configuration Storage (File-Based with Password Protection)
+// ============================================================================
+
+// Configuration directory
+const CONFIG_DIR = path.join(process.cwd(), 'configs');
+
+// Session storage for unlocked configurations
+// Key: sessionToken, Value: { userId, config, unlockedAt, expiresAt }
+const unlockedConfigs = {};
+const SESSION_TIMEOUT = 30 * 60 * 1000; // 30 minutes
+const SESSION_COOKIE_NAME = 'aisubs_session';
+
+// Server-side master key for encrypting public configs (read-only access)
+// This allows loading configs on startup without user passwords
+// Set MASTER_KEY in .env for production, or it will generate a random one (configs won't persist across restarts)
+// Note: If MASTER_KEY is not set in .env, a new random key is generated on each restart,
+// which means old public configs won't be decryptable. Set MASTER_KEY in .env for production.
+let MASTER_KEY = process.env.MASTER_KEY;
+if (!MASTER_KEY) {
+  MASTER_KEY = crypto.randomBytes(32).toString('hex');
+  console.warn('⚠️  MASTER_KEY not set in .env - using random key. Public configs will not persist across restarts.');
+  console.warn('   Set MASTER_KEY in .env for production use.');
+}
+
+/**
+ * Hash a password using PBKDF2
+ */
+function hashPassword(password, salt = null) {
+  if (!salt) {
+    salt = crypto.randomBytes(32).toString('hex');
+  }
+  const hash = crypto.pbkdf2Sync(password, salt, 100000, 64, 'sha512').toString('hex');
+  return { hash, salt };
+}
+
+/**
+ * Verify password against hash
+ */
+function verifyPassword(password, hash, salt) {
+  const hashToVerify = crypto.pbkdf2Sync(password, salt, 100000, 64, 'sha512').toString('hex');
+  return hashToVerify === hash;
+}
+
+/**
+ * Derive encryption key from password using PBKDF2
+ */
+function deriveKeyFromPassword(password, salt) {
+  return crypto.pbkdf2Sync(password, salt, 100000, 32, 'sha512');
+}
+
+/**
+ * Encrypt configuration data with user's password
+ */
+function encryptConfigWithPassword(data, password, salt) {
+  const key = deriveKeyFromPassword(password, salt);
+  const iv = crypto.randomBytes(16);
+  const cipher = crypto.createCipheriv('aes-256-cbc', key, iv);
+  let encrypted = cipher.update(JSON.stringify(data), 'utf8', 'base64');
+  encrypted += cipher.final('base64');
+  return {
+    iv: iv.toString('base64'),
+    encrypted: encrypted
+  };
+}
+
+/**
+ * Decrypt configuration data with user's password
+ */
+function decryptConfigWithPassword(encryptedData, password, salt) {
+  try {
+    const key = deriveKeyFromPassword(password, salt);
+    const iv = Buffer.from(encryptedData.iv, 'base64');
+    const decipher = crypto.createDecipheriv('aes-256-cbc', key, iv);
+    let decrypted = decipher.update(encryptedData.encrypted, 'base64', 'utf8');
+    decrypted += decipher.final('utf8');
+    return JSON.parse(decrypted);
+  } catch (error) {
+    throw new Error('Decryption failed. Incorrect password or corrupted data.');
+  }
+}
+
+/**
+ * Ensure configs directory exists
+ */
+async function ensureConfigDir() {
+  try {
+    await fs.mkdir(CONFIG_DIR, { recursive: true });
+  } catch (error) {
+    console.error('Error creating configs directory:', error);
+    throw error;
+  }
+}
+
+/**
+ * Encrypt data with server master key (for public configs - read-only access)
+ */
+function encryptWithMasterKey(data) {
+  const key = crypto.createHash('sha256').update(MASTER_KEY).digest();
+  const iv = crypto.randomBytes(16);
+  const cipher = crypto.createCipheriv('aes-256-cbc', key, iv);
+  let encrypted = cipher.update(JSON.stringify(data), 'utf8', 'base64');
+  encrypted += cipher.final('base64');
+  return {
+    iv: iv.toString('base64'),
+    encrypted: encrypted
+  };
+}
+
+/**
+ * Decrypt data with server master key (for public configs - read-only access)
+ */
+function decryptWithMasterKey(encryptedData) {
+  try {
+    const key = crypto.createHash('sha256').update(MASTER_KEY).digest();
+    const iv = Buffer.from(encryptedData.iv, 'base64');
+    const decipher = crypto.createDecipheriv('aes-256-cbc', key, iv);
+    let decrypted = decipher.update(encryptedData.encrypted, 'base64', 'utf8');
+    decrypted += decipher.final('utf8');
+    return JSON.parse(decrypted);
+  } catch (error) {
+    throw new Error('Failed to decrypt public config');
+  }
+}
+
+/**
+ * Save user configuration to JSON file (password-protected)
+ */
+async function saveUserConfig(userId, config, password) {
+  await ensureConfigDir();
+  const configPath = path.join(CONFIG_DIR, `${userId}.json`);
+  
+  // Hash password for storage
+  const passwordHash = hashPassword(password);
+  
+  // Encrypt full config with password
+  const encryptedConfig = encryptConfigWithPassword(config, password, passwordHash.salt);
+  
+  // Create public config (languages and API key only) encrypted with server master key
+  // This allows loading on startup without user passwords for read-only subtitle requests
+  const publicConfig = {
+    languages: config.languages || ['en'],
+    openrouter: {
+      apiKey: config.openrouter?.apiKey || '',
+      referer: config.openrouter?.referer || ''
+    },
+    translation: {
+      enabled: config.translation?.enabled || false,
+      model: config.translation?.model || 'auto'
+    }
+  };
+  const encryptedPublicConfig = encryptWithMasterKey(publicConfig);
+  
+  const configData = {
+    userId,
+    passwordHash: passwordHash.hash,
+    passwordSalt: passwordHash.salt,
+    encryptedConfig: encryptedConfig,
+    encryptedPublicConfig: encryptedPublicConfig, // For read-only access without password
+    updatedAt: new Date().toISOString(),
+    version: '1.0.0'
+  };
+  
+  try {
+    await fs.writeFile(configPath, JSON.stringify(configData, null, 2), 'utf8');
+    // Set file permissions to 600 (owner read/write only)
+    await fs.chmod(configPath, 0o600);
+    
+    // Update in-memory cache immediately
+    userPreferences[userId] = publicConfig;
+    
+    return configData;
+  } catch (error) {
+    console.error(`Error saving config for user ${userId}:`, error);
+    throw error;
+  }
+}
+
+/**
+ * Load and decrypt user configuration from JSON file
+ */
+async function loadUserConfig(userId, password) {
+  try {
+    const configPath = path.join(CONFIG_DIR, `${userId}.json`);
+    const data = await fs.readFile(configPath, 'utf8');
+    const fileData = JSON.parse(data);
+    
+    // Verify password
+    if (!verifyPassword(password, fileData.passwordHash, fileData.passwordSalt)) {
+      throw new Error('Incorrect password');
+    }
+    
+    // Decrypt config
+    const decryptedConfig = decryptConfigWithPassword(
+      fileData.encryptedConfig,
+      password,
+      fileData.passwordSalt
+    );
+    
+    return decryptedConfig;
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      return null; // Config doesn't exist
+    }
+    if (error.message === 'Incorrect password' || error.message.includes('Decryption failed')) {
+      throw error; // Re-throw password errors
+    }
+    console.error(`Error loading config for user ${userId}:`, error);
+    throw error;
+  }
+}
+
+/**
+ * Check if config file exists (without decrypting)
+ */
+async function configFileExists(userId) {
+  try {
+    const configPath = path.join(CONFIG_DIR, `${userId}.json`);
+    await fs.access(configPath);
+    return true;
+  } catch (error) {
+    return false;
+  }
+}
+
+/**
+ * Load public config from file (without password - for read-only access)
+ */
+async function loadPublicConfig(userId) {
+  try {
+    const configPath = path.join(CONFIG_DIR, `${userId}.json`);
+    const data = await fs.readFile(configPath, 'utf8');
+    const fileData = JSON.parse(data);
+    
+    // Decrypt public config with server master key
+    if (fileData.encryptedPublicConfig) {
+      const publicConfig = decryptWithMasterKey(fileData.encryptedPublicConfig);
+      return publicConfig;
+    }
+    
+    // Fallback: if old format without public config, return null
+    return null;
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      return null; // Config doesn't exist
+    }
+    console.error(`Error loading public config for user ${userId}:`, error);
+    return null;
+  }
+}
+
+/**
+ * Load all public configurations on server start (for subtitle requests)
+ */
+async function loadAllConfigs() {
+  await ensureConfigDir();
+  try {
+    const files = await fs.readdir(CONFIG_DIR);
+    const configFiles = files.filter(file => file.endsWith('.json'));
+    console.log(`Found ${configFiles.length} configuration file(s) in ${CONFIG_DIR}`);
+    
+    // Load public configs into memory cache
+    let loadedCount = 0;
+    for (const file of configFiles) {
+      const userId = file.replace('.json', '');
+      try {
+        const publicConfig = await loadPublicConfig(userId);
+        if (publicConfig) {
+          userPreferences[userId] = publicConfig;
+          loadedCount++;
+          console.log(`  ✓ Loaded config for ${userId} - Languages: ${publicConfig.languages?.join(', ') || 'en'}, API Key: ${publicConfig.openrouter?.apiKey ? 'Configured' : 'Not set'}`);
+        }
+      } catch (error) {
+        console.error(`  ✗ Failed to load config for ${userId}:`, error.message);
+      }
+    }
+    
+    console.log(`Loaded ${loadedCount} public configuration(s) into memory cache`);
+    return loadedCount;
+  } catch (error) {
+    console.error('Error loading configs:', error);
+    return 0;
+  }
+}
+
+/**
+ * Generate a secure session token
+ */
+function generateSessionToken() {
+  return crypto.randomBytes(32).toString('hex');
+}
+
+/**
+ * Store unlocked config in session with a session token
+ */
+function unlockConfig(userId, config, password = null) {
+  const sessionToken = generateSessionToken();
+  unlockedConfigs[sessionToken] = {
+    userId: userId,
+    config: config,
+    password: password, // Store password temporarily for saving without re-entering
+    unlockedAt: Date.now(),
+    expiresAt: Date.now() + SESSION_TIMEOUT
+  };
+  return sessionToken;
+}
+
+/**
+ * Get unlocked config from session using session token
+ */
+function getUnlockedConfig(sessionToken) {
+  if (!sessionToken) {
+    return null;
+  }
+  
+  const session = unlockedConfigs[sessionToken];
+  if (!session) {
+    return null;
+  }
+  
+  // Check if session expired
+  if (Date.now() > session.expiresAt) {
+    delete unlockedConfigs[sessionToken];
+    return null;
+  }
+  
+  return session.config;
+}
+
+/**
+ * Get session token from request cookies
+ */
+function getSessionToken(req) {
+  return req.cookies?.[SESSION_COOKIE_NAME] || null;
+}
+
+/**
+ * Check if config is unlocked for this request
+ */
+function isConfigUnlocked(req, userId) {
+  const sessionToken = getSessionToken(req);
+  if (!sessionToken) {
+    return false;
+  }
+  
+  const session = unlockedConfigs[sessionToken];
+  if (!session) {
+    return false;
+  }
+  
+  // Check if session is for this user
+  if (session.userId !== userId) {
+    return false;
+  }
+  
+  // Check if session expired
+  if (Date.now() > session.expiresAt) {
+    delete unlockedConfigs[sessionToken];
+    return false;
+  }
+  
+  return true;
+}
+
+/**
+ * Lock config (remove from session)
+ */
+function lockConfig(sessionToken) {
+  if (sessionToken) {
+    delete unlockedConfigs[sessionToken];
+  }
 }
 
 // ============================================================================
@@ -502,15 +919,11 @@ function calculateRequestDelay(modelConfig) {
  * Translate subtitles with intelligent chunking (optimized for RPM, TPM, RPD)
  */
 async function translateSubtitlesWithGeminiChunked(subtitleContent, targetLanguage, userConfig) {
-  // Extract user's OpenRouter credentials
-  const userApiKey = userConfig?.openrouter?.apiKey;
-  const userReferer = userConfig?.openrouter?.referer;
+  // Extract user's OpenRouter credentials (required - no fallback)
+  const apiKey = userConfig?.openrouter?.apiKey;
+  const referer = userConfig?.openrouter?.referer || 'https://stremio-ai-subs.local';
   
-  // Fallback to server key if user hasn't configured (for backward compatibility during transition)
-  const apiKey = userApiKey || process.env.OPENROUTER_API_KEY;
-  const referer = userReferer || process.env.OPENROUTER_REFERER || 'https://stremio-ai-subs.local';
-  
-  if (!apiKey) {
+  if (!apiKey || apiKey.trim() === '') {
     throw new Error(
       'OpenRouter API key not configured. ' +
       'Please visit the configuration page and add your OpenRouter API key. ' +
@@ -539,7 +952,7 @@ async function translateSubtitlesWithGeminiChunked(subtitleContent, targetLangua
   }
   
   console.log(`Translating ${chunks.length} chunk(s) with ${selectedModelName}`);
-  console.log(`  Using API key: ${userApiKey ? 'User key' : 'Server key (fallback)'}`);
+  console.log(`  Using user's OpenRouter API key`);
   console.log(`  Model limits: ${selectedModelConfig.rpm} RPM, ${(selectedModelConfig.tpm/1000).toFixed(0)}K TPM, ${selectedModelConfig.rpd} RPD`);
   
   // Calculate optimal delay between requests
@@ -829,16 +1242,15 @@ async function translateSubtitlesWithGemini(subtitleContent, targetLanguage, use
     return await translateSubtitlesWithGeminiChunked(subtitleContent, targetLanguage, userConfig);
   }
   
-  // Extract user's credentials
-  const userApiKey = userConfig?.openrouter?.apiKey;
-  const userReferer = userConfig?.openrouter?.referer;
-  const apiKey = userApiKey || process.env.OPENROUTER_API_KEY;
-  const referer = userReferer || process.env.OPENROUTER_REFERER || 'https://stremio-ai-subs.local';
+  // Extract user's credentials (required - no fallback)
+  const apiKey = userConfig?.openrouter?.apiKey;
+  const referer = userConfig?.openrouter?.referer || 'https://stremio-ai-subs.local';
   
-  if (!apiKey) {
+  if (!apiKey || apiKey.trim() === '') {
     throw new Error(
       'OpenRouter API key not configured. ' +
-      'Please visit the configuration page and add your OpenRouter API key.'
+      'Please visit the configuration page and add your OpenRouter API key. ' +
+      'Get your key at https://openrouter.ai/keys'
     );
   }
   
@@ -1190,11 +1602,176 @@ function generateErrorPage(title, message) {
 }
 
 /**
+ * Generate password setup page for new users
+ */
+function generateSetupPage(uuid, encryptedConfig, errorMessage = null) {
+  const baseUrl = process.env.BASE_URL || 'http://localhost:7001';
+  
+  return `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Setup Configuration - AI Subtitle Translator</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    :root {
+      --background: 0 0% 3.9%;
+      --foreground: 0 0% 98%;
+      --card: 0 0% 7%;
+      --border: 0 0% 14.9%;
+      --primary: 221.2 83.2% 53.3%;
+      --muted-foreground: 0 0% 63.9%;
+    }
+    body {
+      background-color: hsl(var(--background));
+      color: hsl(var(--foreground));
+      font-family: ui-sans-serif, system-ui, sans-serif;
+    }
+  </style>
+</head>
+<body class="min-h-screen flex items-center justify-center p-4">
+  <div class="bg-[hsl(var(--card))] border border-[hsl(var(--border))] rounded-xl shadow-2xl p-8 max-w-md w-full">
+    <h1 class="text-2xl font-bold mb-2">Setup Configuration</h1>
+    <p class="text-[hsl(var(--muted-foreground))] mb-6">Create a password to protect your configuration settings.</p>
+    
+    ${errorMessage ? `
+      <div class="bg-red-900/20 border border-red-700/50 rounded-md p-3 mb-4">
+        <p class="text-red-200 text-sm">${errorMessage}</p>
+      </div>
+    ` : ''}
+    
+    <form method="POST" action="/stremio/${uuid}/${encryptedConfig}/configure">
+      <input type="hidden" name="setup" value="1">
+      
+      <div class="mb-4">
+        <label for="password" class="block text-sm font-medium mb-2">
+          Password <span class="text-red-500">*</span>
+        </label>
+        <input 
+          type="password" 
+          id="password" 
+          name="password" 
+          required
+          minlength="8"
+          class="w-full px-3 py-2 bg-[hsl(var(--background))] border border-[hsl(var(--border))] rounded-md text-[hsl(var(--foreground))] focus:outline-none focus:ring-2 focus:ring-[hsl(var(--primary))]"
+          autocomplete="new-password"
+          autofocus
+        >
+        <p class="text-xs text-[hsl(var(--muted-foreground))] mt-1">Minimum 8 characters</p>
+      </div>
+      
+      <div class="mb-6">
+        <label for="confirmPassword" class="block text-sm font-medium mb-2">
+          Confirm Password <span class="text-red-500">*</span>
+        </label>
+        <input 
+          type="password" 
+          id="confirmPassword" 
+          name="confirmPassword" 
+          required
+          minlength="8"
+          class="w-full px-3 py-2 bg-[hsl(var(--background))] border border-[hsl(var(--border))] rounded-md text-[hsl(var(--foreground))] focus:outline-none focus:ring-2 focus:ring-[hsl(var(--primary))]"
+          autocomplete="new-password"
+        >
+      </div>
+      
+      <button 
+        type="submit"
+        class="w-full px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white font-medium rounded-md transition-colors"
+      >
+        Create Configuration
+      </button>
+    </form>
+  </div>
+</body>
+</html>
+  `;
+}
+
+/**
+ * Generate password unlock page for existing users
+ */
+function generateUnlockPage(uuid, encryptedConfig, errorMessage = null) {
+  const baseUrl = process.env.BASE_URL || 'http://localhost:7001';
+  
+  return `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Unlock Configuration - AI Subtitle Translator</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    :root {
+      --background: 0 0% 3.9%;
+      --foreground: 0 0% 98%;
+      --card: 0 0% 7%;
+      --border: 0 0% 14.9%;
+      --primary: 221.2 83.2% 53.3%;
+      --muted-foreground: 0 0% 63.9%;
+    }
+    body {
+      background-color: hsl(var(--background));
+      color: hsl(var(--foreground));
+      font-family: ui-sans-serif, system-ui, sans-serif;
+    }
+  </style>
+</head>
+<body class="min-h-screen flex items-center justify-center p-4">
+  <div class="bg-[hsl(var(--card))] border border-[hsl(var(--border))] rounded-xl shadow-2xl p-8 max-w-md w-full">
+    <h1 class="text-2xl font-bold mb-2">Unlock Configuration</h1>
+    <p class="text-[hsl(var(--muted-foreground))] mb-6">Enter your password to access your configuration settings.</p>
+    
+    ${errorMessage ? `
+      <div class="bg-red-900/20 border border-red-700/50 rounded-md p-3 mb-4">
+        <p class="text-red-200 text-sm">${errorMessage}</p>
+      </div>
+    ` : ''}
+    
+    <form method="GET" action="/stremio/${uuid}/${encryptedConfig}/configure">
+      <input type="hidden" name="unlock" value="1">
+      
+      <div class="mb-6">
+        <label for="password" class="block text-sm font-medium mb-2">
+          Password <span class="text-red-500">*</span>
+        </label>
+        <input 
+          type="password" 
+          id="password" 
+          name="password" 
+          required
+          class="w-full px-3 py-2 bg-[hsl(var(--background))] border border-[hsl(var(--border))] rounded-md text-[hsl(var(--foreground))] focus:outline-none focus:ring-2 focus:ring-[hsl(var(--primary))]"
+          autocomplete="current-password"
+          autofocus
+        >
+      </div>
+      
+      <button 
+        type="submit"
+        class="w-full px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white font-medium rounded-md transition-colors"
+      >
+        Unlock Configuration
+      </button>
+    </form>
+    
+    <p class="text-xs text-[hsl(var(--muted-foreground))] mt-4 text-center">
+      Forgot your password? You'll need to create a new configuration.
+    </p>
+      </div>
+    </body>
+    </html>
+  `;
+}
+
+/**
  * Configuration page - Built with shadcn-inspired components
  */
-app.get('/stremio/:uuid/:encryptedConfig/configure', (req, res) => {
+app.get('/stremio/:uuid/:encryptedConfig/configure', async (req, res) => {
   const { uuid, encryptedConfig } = req.params;
-  const menu = req.query.menu || 'languages';
+  const { unlock } = req.query;
   
   // Validate UUID format
   if (!isValidUUID(uuid)) {
@@ -1204,55 +1781,74 @@ app.get('/stremio/:uuid/:encryptedConfig/configure', (req, res) => {
     ));
   }
   
-  // Decrypt config or create new
-  let config = null;
-  let userId = uuid;
+  const userId = uuid;
+  const fileExists = await configFileExists(userId);
   
-  if (encryptedConfig && encryptedConfig !== 'new') {
-    config = decryptConfig(encryptedConfig);
-    
-    // If decryption fails, return error
-    if (!config) {
-      return res.status(400).send(generateErrorPage(
-        'Invalid Configuration',
-        'The encrypted configuration is invalid or corrupted. Please create a new configuration.'
-      ));
-    }
-    
-    // Validate that the UUID in the decrypted config matches the URL UUID
-    if (config.uuid && config.uuid !== uuid) {
-      return res.status(400).send(generateErrorPage(
-        'Invalid Configuration',
-        'The configuration ID does not match. This configuration may belong to a different user.'
-      ));
-    }
-    
-    userId = config.uuid || uuid;
+  // Check if config is already unlocked in session (cookie-based)
+  if (isConfigUnlocked(req, userId)) {
+    const sessionToken = getSessionToken(req);
+    const currentPrefs = getUnlockedConfig(sessionToken);
+    return renderConfigPage(req, res, userId, uuid, encryptedConfig, currentPrefs);
   }
   
-  // Get or create preferences
-  if (!userPreferences[userId]) {
-    userPreferences[userId] = { 
-      languages: ['en'], 
-      uuid: userId,
-      openrouter: {
-        apiKey: '',  // Empty by default
-        referer: process.env.OPENROUTER_REFERER || ''
-      },
-      translation: {
-        enabled: false,
-        model: 'auto'
+  // Handle unlock attempt
+  if (unlock === '1' && req.query.password) {
+    if (!fileExists) {
+      return res.send(generateUnlockPage(uuid, encryptedConfig, 'Configuration not found. Please set up a new configuration.'));
+    }
+    
+    try {
+      const password = req.query.password;
+      const config = await loadUserConfig(userId, password);
+      
+      // Unlock config in session and get session token (store password for later use)
+      const sessionToken = unlockConfig(userId, config, password);
+      
+      // Set session cookie
+      res.cookie(SESSION_COOKIE_NAME, sessionToken, {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === 'production',
+        sameSite: 'lax',
+        maxAge: SESSION_TIMEOUT
+      });
+      
+      // Redirect to config page
+      res.redirect(`/stremio/${uuid}/${encryptedConfig}/configure`);
+      return;
+    } catch (error) {
+      if (error.message === 'Incorrect password' || error.message.includes('Decryption failed')) {
+        return res.send(generateUnlockPage(uuid, encryptedConfig, 'Incorrect password. Please try again.'));
       }
-    };
+      console.error('Error unlocking config:', error);
+      return res.send(generateUnlockPage(uuid, encryptedConfig, 'An error occurred while unlocking your configuration.'));
+    }
   }
   
-  const currentPrefs = userPreferences[userId];
+  // If config exists, show unlock form
+  if (fileExists) {
+    return res.send(generateUnlockPage(uuid, encryptedConfig));
+  }
+  
+  // Show setup form for new users
+  return res.send(generateSetupPage(uuid, encryptedConfig));
+});
+
+/**
+ * Render the main configuration page
+ */
+function renderConfigPage(req, res, userId, uuid, encryptedConfig, currentPrefs) {
   const selectedLangs = currentPrefs.languages || ['en'];
   const saved = req.query.saved === 'true';
-  
-  // Build manifest URL for installation
   const baseUrl = process.env.BASE_URL || `http://${req.get('host')}`;
   const manifestUrl = `${baseUrl}/stremio/${uuid}/${encryptedConfig}/manifest.json`;
+  
+  // Check if config has been saved at least once (has API key or languages configured)
+  const hasApiKey = currentPrefs.openrouter?.apiKey && currentPrefs.openrouter.apiKey.length > 0;
+  const hasLanguages = selectedLangs && selectedLangs.length > 0;
+  const showInstallSection = saved || hasApiKey || hasLanguages;
+  
+  // Check if session is unlocked (password not required if unlocked)
+  const isUnlocked = isConfigUnlocked(req, userId);
   
   // Comprehensive list of languages with their names
   const languages = [
@@ -1574,15 +2170,28 @@ app.get('/stremio/:uuid/:encryptedConfig/configure', (req, res) => {
                     <label for="openrouterApiKey" class="block text-sm font-medium mb-2">
                       OpenRouter API Key <span class="text-red-500">*</span>
                     </label>
-                    <input 
-                      type="password" 
-                      id="openrouterApiKey" 
-                      name="openrouterApiKey" 
-                      placeholder="sk-or-v1-..."
-                      value="${currentPrefs.openrouter?.apiKey ? '***' + currentPrefs.openrouter.apiKey.slice(-4) : ''}"
-                      class="w-full px-3 py-2 bg-[hsl(var(--background))] border border-[hsl(var(--border))] rounded-md text-[hsl(var(--foreground))]"
-                      autocomplete="off"
-                    >
+                    <div class="relative">
+                      <input 
+                        type="password" 
+                        id="openrouterApiKey" 
+                        name="openrouterApiKey" 
+                        placeholder="sk-or-v1-..."
+                        value="${currentPrefs.openrouter?.apiKey || ''}"
+                        class="w-full px-3 py-2 pr-10 bg-[hsl(var(--background))] border border-[hsl(var(--border))] rounded-md text-[hsl(var(--foreground))]"
+                        autocomplete="off"
+                      >
+                      <button 
+                        type="button"
+                        onclick="toggleApiKeyVisibility()"
+                        class="absolute right-3 top-1/2 transform -translate-y-1/2 text-[hsl(var(--muted-foreground))] hover:text-[hsl(var(--foreground))] focus:outline-none"
+                        aria-label="Toggle API key visibility"
+                      >
+                        <svg id="apiKeyEyeIcon" class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path>
+                          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"></path>
+                        </svg>
+                      </button>
+                    </div>
                     <p class="text-xs text-[hsl(var(--muted-foreground))] mt-1">
                       Your API key is encrypted and stored securely. Required for AI translation.
                     </p>
@@ -1673,13 +2282,15 @@ app.get('/stremio/:uuid/:encryptedConfig/configure', (req, res) => {
                 </div>
               </form>
               
-              ${saved ? `
+              ${showInstallSection ? `
         <!-- Success Message & Installation Buttons -->
         <div class="mt-6 p-6 bg-[hsl(var(--card))] border border-[hsl(var(--border))] rounded-lg">
+          ${saved ? `
           <div class="flex items-center gap-3 mb-4">
             <div class="w-8 h-8 bg-green-500 rounded-full flex items-center justify-center text-white text-sm font-bold flex-shrink-0">✓</div>
             <div class="text-sm font-medium text-[hsl(var(--foreground))]">Configuration saved successfully!</div>
           </div>
+          ` : ''}
           
           <div class="space-y-3">
             <div class="text-sm font-medium text-[hsl(var(--muted-foreground))] mb-3">Install this addon:</div>
@@ -1743,6 +2354,26 @@ app.get('/stremio/:uuid/:encryptedConfig/configure', (req, res) => {
               console.error('Failed to copy:', err);
               alert('Failed to copy URL. Please copy manually.');
             });
+          }
+          
+          // Remove ?saved=true from URL after page loads to prevent showing message on refresh
+          if (window.location.search.includes('saved=true')) {
+            const url = new URL(window.location);
+            url.searchParams.delete('saved');
+            window.history.replaceState({}, '', url);
+          }
+          
+          // Toggle API key visibility
+          function toggleApiKeyVisibility() {
+            const input = document.getElementById('openrouterApiKey');
+            const icon = document.getElementById('apiKeyEyeIcon');
+            if (input.type === 'password') {
+              input.type = 'text';
+              icon.innerHTML = '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21"></path>';
+            } else {
+              input.type = 'password';
+              icon.innerHTML = '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"></path>';
+            }
           }
         </script>
               ` : ''}
@@ -1832,46 +2463,788 @@ app.get('/stremio/:uuid/:encryptedConfig/configure', (req, res) => {
     </body>
     </html>
   `);
-});
+}
+
+/**
+ * Render the main configuration page
+ */
+function renderConfigPage(req, res, userId, uuid, encryptedConfig, currentPrefs) {
+  const selectedLangs = currentPrefs.languages || ['en'];
+  const saved = req.query.saved === 'true';
+  const baseUrl = process.env.BASE_URL || `http://${req.get('host')}`;
+  const manifestUrl = `${baseUrl}/stremio/${uuid}/${encryptedConfig}/manifest.json`;
+  
+  // Check if config has been saved at least once (has API key or languages configured)
+  const hasApiKey = currentPrefs.openrouter?.apiKey && currentPrefs.openrouter.apiKey.length > 0;
+  const hasLanguages = selectedLangs && selectedLangs.length > 0;
+  const showInstallSection = saved || hasApiKey || hasLanguages;
+  
+  // Check if session is unlocked (password not required if unlocked)
+  const isUnlocked = isConfigUnlocked(req, userId);
+  
+  // Comprehensive list of languages with their names
+  const languages = [
+    { code: 'en', name: 'English', flag: '🇬🇧' },
+    { code: 'es', name: 'Spanish', flag: '🇪🇸' },
+    { code: 'fr', name: 'French', flag: '🇫🇷' },
+    { code: 'de', name: 'German', flag: '🇩🇪' },
+    { code: 'it', name: 'Italian', flag: '🇮🇹' },
+    { code: 'pt', name: 'Portuguese', flag: '🇵🇹' },
+    { code: 'ru', name: 'Russian', flag: '🇷🇺' },
+    { code: 'ja', name: 'Japanese', flag: '🇯🇵' },
+    { code: 'ko', name: 'Korean', flag: '🇰🇷' },
+    { code: 'zh', name: 'Chinese', flag: '🇨🇳' },
+    { code: 'ar', name: 'Arabic', flag: '🇸🇦' },
+    { code: 'hi', name: 'Hindi', flag: '🇮🇳' },
+    { code: 'nl', name: 'Dutch', flag: '🇳🇱' },
+    { code: 'sv', name: 'Swedish', flag: '🇸🇪' },
+    { code: 'no', name: 'Norwegian', flag: '🇳🇴' },
+    { code: 'da', name: 'Danish', flag: '🇩🇰' },
+    { code: 'fi', name: 'Finnish', flag: '🇫🇮' },
+    { code: 'pl', name: 'Polish', flag: '🇵🇱' },
+    { code: 'tr', name: 'Turkish', flag: '🇹🇷' },
+    { code: 'vi', name: 'Vietnamese', flag: '🇻🇳' },
+    { code: 'th', name: 'Thai', flag: '🇹🇭' },
+    { code: 'id', name: 'Indonesian', flag: '🇮🇩' },
+    { code: 'ms', name: 'Malay', flag: '🇲🇾' },
+    { code: 'cs', name: 'Czech', flag: '🇨🇿' },
+    { code: 'hu', name: 'Hungarian', flag: '🇭🇺' },
+    { code: 'ro', name: 'Romanian', flag: '🇷🇴' },
+    { code: 'el', name: 'Greek', flag: '🇬🇷' },
+    { code: 'he', name: 'Hebrew', flag: '🇮🇱' },
+    { code: 'uk', name: 'Ukrainian', flag: '🇺🇦' },
+    { code: 'bg', name: 'Bulgarian', flag: '🇧🇬' },
+    { code: 'hr', name: 'Croatian', flag: '🇭🇷' },
+    { code: 'sk', name: 'Slovak', flag: '🇸🇰' },
+    { code: 'sl', name: 'Slovenian', flag: '🇸🇮' },
+    { code: 'sr', name: 'Serbian', flag: '🇷🇸' },
+    { code: 'ca', name: 'Catalan', flag: '🇪🇸' },
+    { code: 'eu', name: 'Basque', flag: '🇪🇸' },
+    { code: 'fa', name: 'Persian', flag: '🇮🇷' },
+    { code: 'ur', name: 'Urdu', flag: '🇵🇰' },
+    { code: 'bn', name: 'Bengali', flag: '🇧🇩' },
+    { code: 'ta', name: 'Tamil', flag: '🇮🇳' },
+    { code: 'te', name: 'Telugu', flag: '🇮🇳' },
+    { code: 'ml', name: 'Malayalam', flag: '🇮🇳' },
+    { code: 'kn', name: 'Kannada', flag: '🇮🇳' }
+  ];
+  
+  res.send(`
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>AI Subtitle Translator - Configuration</title>
+      <script src="https://cdn.tailwindcss.com"></script>
+      <script>
+        tailwind.config = {
+          darkMode: 'class',
+          theme: {
+            extend: {
+              colors: {
+                border: "hsl(var(--border))",
+                input: "hsl(var(--input))",
+                ring: "hsl(var(--ring))",
+                background: "hsl(var(--background))",
+                foreground: "hsl(var(--foreground))",
+                primary: {
+                  DEFAULT: "hsl(var(--primary))",
+                  foreground: "hsl(var(--primary-foreground))",
+                },
+                secondary: {
+                  DEFAULT: "hsl(var(--secondary))",
+                  foreground: "hsl(var(--secondary-foreground))",
+                },
+                destructive: {
+                  DEFAULT: "hsl(var(--destructive))",
+                  foreground: "hsl(var(--destructive-foreground))",
+                },
+                muted: {
+                  DEFAULT: "hsl(var(--muted))",
+                  foreground: "hsl(var(--muted-foreground))",
+                },
+                accent: {
+                  DEFAULT: "hsl(var(--accent))",
+                  foreground: "hsl(var(--accent-foreground))",
+                },
+                popover: {
+                  DEFAULT: "hsl(var(--popover))",
+                  foreground: "hsl(var(--popover-foreground))",
+                },
+                card: {
+                  DEFAULT: "hsl(var(--card))",
+                  foreground: "hsl(var(--card-foreground))",
+                },
+              },
+              borderRadius: {
+                lg: "var(--radius)",
+                md: "calc(var(--radius) - 2px)",
+                sm: "calc(var(--radius) - 4px)",
+              },
+            },
+          },
+        }
+      </script>
+      <style>
+        :root {
+          --background: 0 0% 3.9%;
+          --foreground: 0 0% 98%;
+          --card: 0 0% 7%;
+          --card-foreground: 0 0% 98%;
+          --popover: 0 0% 7%;
+          --popover-foreground: 0 0% 98%;
+          --primary: 221.2 83.2% 53.3%;
+          --primary-foreground: 210 40% 98%;
+          --secondary: 0 0% 14.9%;
+          --secondary-foreground: 0 0% 98%;
+          --muted: 0 0% 14.9%;
+          --muted-foreground: 0 0% 63.9%;
+          --accent: 0 0% 14.9%;
+          --accent-foreground: 0 0% 98%;
+          --destructive: 0 62.8% 30.6%;
+          --destructive-foreground: 0 0% 98%;
+          --border: 0 0% 14.9%;
+          --input: 0 0% 14.9%;
+          --ring: 221.2 83.2% 53.3%;
+          --radius: 0.5rem;
+        }
+        
+        * {
+          border-color: hsl(var(--border));
+        }
+        
+        body {
+          background-color: hsl(var(--background));
+          color: hsl(var(--foreground));
+          font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", sans-serif;
+        }
+        
+        @keyframes slideIn {
+          from {
+            opacity: 0;
+            transform: translateY(-10px);
+          }
+          to {
+            opacity: 1;
+            transform: translateY(0);
+          }
+        }
+        
+        .animate-slide-in {
+          animation: slideIn 0.3s ease-out;
+        }
+        
+        .checkbox-custom {
+          appearance: none;
+          width: 1rem;
+          height: 1rem;
+          border: 2px solid hsl(var(--border));
+          border-radius: calc(var(--radius) - 4px);
+          background-color: hsl(var(--background));
+          cursor: pointer;
+          position: relative;
+          transition: all 0.2s;
+        }
+        
+        .checkbox-custom:checked {
+          background-color: hsl(var(--primary));
+          border-color: hsl(var(--primary));
+        }
+        
+        .checkbox-custom:checked::after {
+          content: "✓";
+          position: absolute;
+          top: 50%;
+          left: 50%;
+          transform: translate(-50%, -50%);
+          color: hsl(var(--primary-foreground));
+          font-size: 0.75rem;
+          font-weight: bold;
+        }
+      </style>
+    </head>
+    <body class="min-h-screen" style="background-color: hsl(var(--background)); color: hsl(var(--foreground));">
+      <div class="min-h-screen flex items-center justify-center p-4 sm:p-6 lg:p-8">
+        <div class="w-full max-w-5xl animate-slide-in">
+          <!-- Main Card -->
+          <div class="bg-[hsl(var(--card))] border border-[hsl(var(--border))] rounded-xl shadow-2xl overflow-hidden">
+            <!-- Header -->
+            <div class="bg-[hsl(var(--card))] px-6 py-6 sm:px-8 sm:py-8 border-b border-[hsl(var(--border))]">
+              <div>
+                <h1 class="text-2xl sm:text-3xl font-semibold text-[hsl(var(--foreground))] mb-1">AI Subtitle Translator</h1>
+                <p class="text-[hsl(var(--muted-foreground))] text-sm sm:text-base">Select your preferred subtitle languages</p>
+              </div>
+            </div>
+            
+            <!-- Content -->
+            <div class="p-6 sm:p-8 bg-[hsl(var(--card))]">
+              <!-- Info Banner -->
+              <div class="mb-6 p-4 bg-[hsl(var(--muted))] border border-[hsl(var(--border))] rounded-lg">
+                <div class="flex items-start gap-3">
+                  <svg class="w-5 h-5 text-indigo-400 flex-shrink-0 mt-0.5" fill="currentColor" viewBox="0 0 20 20">
+                    <path fill-rule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clip-rule="evenodd"/>
+                  </svg>
+                  <div class="text-sm text-[hsl(var(--muted-foreground))]">
+                    <strong class="font-semibold text-[hsl(var(--foreground))]">How it works:</strong> The addon will first try to fetch subtitles in your selected languages. If not available, it will automatically translate English subtitles using AI (OpenRouter).
+                  </div>
+                </div>
+              </div>
+              
+              <form method="POST" action="/stremio/${uuid}/${encryptedConfig}/configure" id="configForm">
+                <input type="hidden" name="userId" value="${userId}">
+                <input type="hidden" name="uuid" value="${uuid}">
+                
+                <!-- Search -->
+                <div class="mb-6">
+                  <div class="relative">
+                    <div class="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
+                      <svg class="h-5 w-5 text-[hsl(var(--muted-foreground))]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path>
+                      </svg>
+                    </div>
+                    <input 
+                      type="text" 
+                      id="searchInput"
+                      class="w-full pl-10 pr-4 py-2.5 bg-[hsl(var(--background))] border border-[hsl(var(--input))] rounded-lg text-[hsl(var(--foreground))] placeholder:text-[hsl(var(--muted-foreground))] focus:outline-none focus:ring-2 focus:ring-[hsl(var(--ring))] focus:border-transparent transition-all"
+                      placeholder="Search languages..."
+                      autocomplete="off"
+                    >
+                  </div>
+                </div>
+                
+                <!-- Toolbar -->
+                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 mb-6">
+                  <div class="flex flex-wrap gap-2">
+                    <button 
+                      type="button" 
+                      onclick="selectAll()"
+                      class="px-4 py-2 text-sm font-medium text-[hsl(var(--foreground))] bg-[hsl(var(--secondary))] border border-[hsl(var(--border))] rounded-lg hover:bg-[hsl(var(--accent))] transition-colors"
+                    >
+                      Select All
+                    </button>
+                    <button 
+                      type="button" 
+                      onclick="deselectAll()"
+                      class="px-4 py-2 text-sm font-medium text-[hsl(var(--foreground))] bg-[hsl(var(--secondary))] border border-[hsl(var(--border))] rounded-lg hover:bg-[hsl(var(--accent))] transition-colors"
+                    >
+                      Deselect All
+                    </button>
+                    <button 
+                      type="button" 
+                      onclick="selectPopular()"
+                      class="px-4 py-2 text-sm font-medium text-[hsl(var(--foreground))] bg-[hsl(var(--secondary))] border border-[hsl(var(--border))] rounded-lg hover:bg-[hsl(var(--accent))] transition-colors"
+                    >
+                      Popular
+                    </button>
+                  </div>
+                  <div class="flex items-center gap-2 px-4 py-2 bg-indigo-500/20 text-indigo-300 rounded-lg border border-indigo-500/30">
+                    <span class="text-xl font-bold" id="selectedCount">0</span>
+                    <span class="text-sm font-medium">selected</span>
+                  </div>
+                </div>
+                
+                <!-- Languages Grid -->
+                <div class="mb-6">
+                  <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-2.5 max-h-[520px] overflow-y-auto p-1" id="languagesGrid">
+                    ${languages.map(lang => `
+                      <label 
+                        class="group relative flex items-center gap-3 p-3 rounded-lg border transition-all cursor-pointer ${
+                          selectedLangs.includes(lang.code) 
+                            ? 'border-indigo-500 bg-indigo-500/10 shadow-md' 
+                            : 'border-[hsl(var(--border))] bg-[hsl(var(--card))] hover:border-indigo-500/40 hover:bg-[hsl(var(--accent))]'
+                        }"
+                        data-lang="${lang.code}"
+                        data-name="${lang.name.toLowerCase()}"
+                      >
+                        <input 
+                          type="checkbox" 
+                          name="languages" 
+                          value="${lang.code}"
+                          ${selectedLangs.includes(lang.code) ? 'checked' : ''}
+                          onchange="updateSelection()"
+                          class="sr-only"
+                        >
+                        <div class="flex-shrink-0 w-8 h-8 rounded-md bg-[hsl(var(--muted))] flex items-center justify-center text-xl">
+                          ${lang.flag}
+                        </div>
+                        <div class="flex-1 min-w-0">
+                          <div class="font-medium text-sm text-[hsl(var(--foreground))] truncate">${lang.name}</div>
+                          <div class="text-xs text-[hsl(var(--muted-foreground))] uppercase tracking-wider mt-0.5">${lang.code}</div>
+                        </div>
+                        <div class="flex-shrink-0 w-5 h-5 rounded border-2 flex items-center justify-center transition-all ${
+                          selectedLangs.includes(lang.code)
+                            ? 'bg-indigo-500 border-indigo-500'
+                            : 'border-[hsl(var(--border))] bg-[hsl(var(--background))] group-hover:border-indigo-500/50'
+                        }">
+                          ${selectedLangs.includes(lang.code) ? `
+                            <svg class="w-3 h-3 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7"></path>
+                            </svg>
+                          ` : ''}
+                        </div>
+                      </label>
+                    `).join('')}
+                  </div>
+                </div>
+                
+                <!-- OpenRouter API Configuration Section -->
+                <div class="bg-[hsl(var(--card))] border border-[hsl(var(--border))] rounded-lg p-6 mb-6">
+                  <h2 class="text-xl font-semibold mb-4">OpenRouter API Configuration</h2>
+                  <p class="text-[hsl(var(--muted-foreground))] text-sm mb-4">
+                    Enter your OpenRouter API key to enable AI translation. 
+                    <a href="https://openrouter.ai/keys" target="_blank" class="text-[hsl(var(--primary))] hover:underline">
+                      Get your API key here
+                    </a>
+                  </p>
+                  
+                  <div class="mb-4">
+                    <label for="openrouterApiKey" class="block text-sm font-medium mb-2">
+                      OpenRouter API Key <span class="text-red-500">*</span>
+                    </label>
+                    <div class="relative">
+                      <input 
+                        type="password" 
+                        id="openrouterApiKey" 
+                        name="openrouterApiKey" 
+                        placeholder="sk-or-v1-..."
+                        value="${currentPrefs.openrouter?.apiKey || ''}"
+                        class="w-full px-3 py-2 pr-10 bg-[hsl(var(--background))] border border-[hsl(var(--border))] rounded-md text-[hsl(var(--foreground))]"
+                        autocomplete="off"
+                      >
+                      <button 
+                        type="button"
+                        onclick="toggleApiKeyVisibility()"
+                        class="absolute right-3 top-1/2 transform -translate-y-1/2 text-[hsl(var(--muted-foreground))] hover:text-[hsl(var(--foreground))] focus:outline-none"
+                        aria-label="Toggle API key visibility"
+                      >
+                        <svg id="apiKeyEyeIcon" class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path>
+                          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"></path>
+                        </svg>
+                      </button>
+                    </div>
+                    <p class="text-xs text-[hsl(var(--muted-foreground))] mt-1">
+                      Your API key is encrypted and stored securely. Required for AI translation.
+                    </p>
+                  </div>
+                  
+                  <div class="mb-4">
+                    <label for="openrouterReferer" class="block text-sm font-medium mb-2">
+                      HTTP Referer (Optional)
+                    </label>
+                    <input 
+                      type="text" 
+                      id="openrouterReferer" 
+                      name="openrouterReferer" 
+                      placeholder="https://your-app.com"
+                      value="${currentPrefs.openrouter?.referer || process.env.OPENROUTER_REFERER || ''}"
+                      class="w-full px-3 py-2 bg-[hsl(var(--background))] border border-[hsl(var(--border))] rounded-md text-[hsl(var(--foreground))]"
+                    >
+                    <p class="text-xs text-[hsl(var(--muted-foreground))] mt-1">
+                      Your app URL or name. Used by OpenRouter for analytics.
+                    </p>
+                  </div>
+                  
+                  <div class="mb-4">
+                    <label for="translationModel" class="block text-sm font-medium mb-2">
+                      Translation Model (Optional)
+                    </label>
+                    <select 
+                      id="translationModel" 
+                      name="translationModel"
+                      class="w-full px-3 py-2 bg-[hsl(var(--background))] border border-[hsl(var(--border))] rounded-md text-[hsl(var(--foreground))]"
+                    >
+                      <option value="auto" ${currentPrefs.translation?.model === 'auto' ? 'selected' : ''}>
+                        Auto (Best Available)
+                      </option>
+                      <option value="meta-llama/llama-3.1-8b-instruct" ${currentPrefs.translation?.model === 'meta-llama/llama-3.1-8b-instruct' ? 'selected' : ''}>
+                        Llama 3.1 8B
+                      </option>
+                      <option value="google/gemma-2-9b-it" ${currentPrefs.translation?.model === 'google/gemma-2-9b-it' ? 'selected' : ''}>
+                        Gemma 2 9B
+                      </option>
+                      <option value="google/gemma-2-2b-it" ${currentPrefs.translation?.model === 'google/gemma-2-2b-it' ? 'selected' : ''}>
+                        Gemma 2 2B
+                      </option>
+                      <option value="google/gemma-2-1.1b-it" ${currentPrefs.translation?.model === 'google/gemma-2-1.1b-it' ? 'selected' : ''}>
+                        Gemma 2 1.1B
+                      </option>
+                      <option value="mistralai/mistral-7b-instruct" ${currentPrefs.translation?.model === 'mistralai/mistral-7b-instruct' ? 'selected' : ''}>
+                        Mistral 7B
+                      </option>
+                    </select>
+                    <p class="text-xs text-[hsl(var(--muted-foreground))] mt-1">
+                      Choose a specific model or let the system auto-select the best available.
+                    </p>
+                  </div>
+                  
+                  ${!currentPrefs.openrouter?.apiKey ? `
+                    <div class="bg-yellow-900/20 border border-yellow-700/50 rounded-md p-3 mb-4">
+                      <p class="text-yellow-200 text-sm">
+                        <strong>⚠️ Translation Disabled</strong><br>
+                        Add your OpenRouter API key to enable AI subtitle translation.
+                      </p>
+                    </div>
+                  ` : `
+                    <div class="bg-green-900/20 border border-green-700/50 rounded-md p-3 mb-4">
+                      <p class="text-green-200 text-sm">
+                        <strong>✅ Translation Enabled</strong><br>
+                        Your OpenRouter API key is configured. Translation will use your account credits.
+                      </p>
+                    </div>
+                  `}
+                </div>
+                
+                <!-- Password Confirmation for Saving -->
+                ${!isUnlocked ? `
+                <div class="bg-yellow-900/20 border border-yellow-700/50 rounded-md p-3 mb-4">
+                  <p class="text-yellow-200 text-sm mb-2">
+                    <strong>⚠️ Password Required</strong><br>
+                    Enter your configuration password to save changes.
+                  </p>
+                  <div class="mb-2">
+                    <label for="savePassword" class="block text-sm font-medium mb-1">
+                      Configuration Password <span class="text-red-500">*</span>
+                    </label>
+                    <input 
+                      type="password" 
+                      id="savePassword" 
+                      name="password" 
+                      required
+                      class="w-full px-3 py-2 bg-[hsl(var(--background))] border border-[hsl(var(--border))] rounded-md text-[hsl(var(--foreground))]"
+                      autocomplete="current-password"
+                      placeholder="Enter your configuration password"
+                    >
+                    <p class="text-xs text-[hsl(var(--muted-foreground))] mt-1">
+                      Your password is required to encrypt and save your configuration.
+                    </p>
+                  </div>
+                </div>
+                ` : `
+                <input type="hidden" name="password" id="savePassword" value="">
+                `}
+                
+                <!-- Actions -->
+                <div class="flex justify-end gap-3 pt-4 border-t border-[hsl(var(--border))]">
+                  <button 
+                    type="button" 
+                    onclick="window.location.reload()"
+                    class="px-5 py-2.5 text-sm font-medium text-[hsl(var(--foreground))] bg-[hsl(var(--secondary))] border border-[hsl(var(--border))] rounded-lg hover:bg-[hsl(var(--accent))] transition-colors"
+                  >
+                    Reset
+                  </button>
+                  <button 
+                    type="submit"
+                    class="px-5 py-2.5 text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg shadow-sm transition-all hover:shadow-md focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 focus:ring-offset-[hsl(var(--background))]"
+                  >
+                    Save Configuration
+                  </button>
+                </div>
+              </form>
+              
+              ${showInstallSection ? `
+        <!-- Success Message & Installation Buttons -->
+        <div class="mt-6 p-6 bg-[hsl(var(--card))] border border-[hsl(var(--border))] rounded-lg">
+          ${saved ? `
+          <div class="flex items-center gap-3 mb-4">
+            <div class="w-8 h-8 bg-green-500 rounded-full flex items-center justify-center text-white text-sm font-bold flex-shrink-0">✓</div>
+            <div class="text-sm font-medium text-[hsl(var(--foreground))]">Configuration saved successfully!</div>
+          </div>
+          ` : ''}
+          
+          <div class="space-y-3">
+            <div class="text-sm font-medium text-[hsl(var(--muted-foreground))] mb-3">Install this addon:</div>
+            
+            <div class="flex flex-col sm:flex-row gap-3">
+              <a 
+                href="stremio://${req.get('host')}/stremio/${uuid}/${encryptedConfig}/manifest.json"
+                class="flex-1 px-4 py-3 text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg transition-all hover:shadow-md flex items-center justify-center gap-2"
+              >
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                </svg>
+                Add to Stremio Desktop
+              </a>
+              
+              <a 
+                href="https://app.strem.io/shell-v4.4/#/addons?addon=${encodeURIComponent(manifestUrl)}"
+                target="_blank"
+                rel="noopener noreferrer"
+                class="flex-1 px-4 py-3 text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg transition-all hover:shadow-md flex items-center justify-center gap-2"
+              >
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9 9c1.657 0 3-4.03 3-9s-1.343-9-3-9m0 18c-1.657 0-3-4.03-3-9s1.343-9 3-9m-9 9a9 9 0 019-9"></path>
+                </svg>
+                Add to Stremio Web
+              </a>
+              
+              <button 
+                onclick="copyAddonUrl()"
+                id="copyUrlBtn"
+                class="px-4 py-3 text-sm font-medium text-[hsl(var(--foreground))] bg-[hsl(var(--secondary))] border border-[hsl(var(--border))] rounded-lg hover:bg-[hsl(var(--accent))] transition-colors flex items-center justify-center gap-2"
+              >
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path>
+                </svg>
+                <span id="copyUrlText">Copy URL</span>
+              </button>
+            </div>
+            
+            <div class="mt-4 p-3 bg-[hsl(var(--muted))] rounded-lg">
+              <div class="text-xs text-[hsl(var(--muted-foreground))] mb-1">Addon URL:</div>
+              <div class="text-xs font-mono text-[hsl(var(--foreground))] break-all" id="addonUrl">${manifestUrl}</div>
+            </div>
+          </div>
+        </div>
+        
+        <script>
+          function copyAddonUrl() {
+            const url = document.getElementById('addonUrl').textContent;
+            navigator.clipboard.writeText(url).then(() => {
+              const btn = document.getElementById('copyUrlBtn');
+              const text = document.getElementById('copyUrlText');
+              const originalText = text.textContent;
+              text.textContent = 'Copied!';
+              btn.classList.add('bg-green-500/20', 'border-green-500/50');
+              setTimeout(() => {
+                text.textContent = originalText;
+                btn.classList.remove('bg-green-500/20', 'border-green-500/50');
+              }, 2000);
+            }).catch(err => {
+              console.error('Failed to copy:', err);
+              alert('Failed to copy URL. Please copy manually.');
+            });
+          }
+          
+          // Remove ?saved=true from URL after page loads to prevent showing message on refresh
+          if (window.location.search.includes('saved=true')) {
+            const url = new URL(window.location);
+            url.searchParams.delete('saved');
+            window.history.replaceState({}, '', url);
+          }
+          
+          // Toggle API key visibility
+          function toggleApiKeyVisibility() {
+            const input = document.getElementById('openrouterApiKey');
+            const icon = document.getElementById('apiKeyEyeIcon');
+            if (input.type === 'password') {
+              input.type = 'text';
+              icon.innerHTML = '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21"></path>';
+            } else {
+              input.type = 'password';
+              icon.innerHTML = '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"></path>';
+            }
+          }
+        </script>
+              ` : ''}
+            </div>
+          </div>
+        </div>
+      </div>
+      
+      <script>
+        const searchInput = document.getElementById('searchInput');
+        const selectedCount = document.getElementById('selectedCount');
+        const languageLabels = document.querySelectorAll('label[data-lang]');
+        
+        function updateSelection() {
+          const checked = document.querySelectorAll('input[name="languages"]:checked').length;
+          selectedCount.textContent = checked;
+          
+          languageLabels.forEach(label => {
+            const checkbox = label.querySelector('input[type="checkbox"]');
+            const checkmark = label.querySelector('.flex-shrink-0.w-5.h-5');
+            const checkmarkSvg = checkmark.querySelector('svg');
+            
+            if (checkbox.checked) {
+              label.classList.remove('border-[hsl(var(--border))]', 'bg-[hsl(var(--card))]', 'hover:border-indigo-500/40', 'hover:bg-[hsl(var(--accent))]');
+              label.classList.add('border-indigo-500', 'bg-indigo-500/10', 'shadow-md');
+              checkmark.classList.remove('border-[hsl(var(--border))]', 'bg-[hsl(var(--background))]', 'group-hover:border-indigo-500/50');
+              checkmark.classList.add('bg-indigo-500', 'border-indigo-500');
+              if (!checkmarkSvg) {
+                const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+                svg.setAttribute('class', 'w-3 h-3 text-white');
+                svg.setAttribute('fill', 'none');
+                svg.setAttribute('stroke', 'currentColor');
+                svg.setAttribute('viewBox', '0 0 24 24');
+                const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+                path.setAttribute('stroke-linecap', 'round');
+                path.setAttribute('stroke-linejoin', 'round');
+                path.setAttribute('stroke-width', '3');
+                path.setAttribute('d', 'M5 13l4 4L19 7');
+                svg.appendChild(path);
+                checkmark.appendChild(svg);
+              }
+            } else {
+              label.classList.remove('border-indigo-500', 'bg-indigo-500/10', 'shadow-md');
+              label.classList.add('border-[hsl(var(--border))]', 'bg-[hsl(var(--card))]', 'hover:border-indigo-500/40', 'hover:bg-[hsl(var(--accent))]');
+              checkmark.classList.remove('bg-indigo-500', 'border-indigo-500');
+              checkmark.classList.add('border-[hsl(var(--border))]', 'bg-[hsl(var(--background))]', 'group-hover:border-indigo-500/50');
+              if (checkmarkSvg) checkmarkSvg.remove();
+            }
+          });
+        }
+        
+        function selectAll() {
+          document.querySelectorAll('input[name="languages"]').forEach(cb => cb.checked = true);
+          updateSelection();
+        }
+        
+        function deselectAll() {
+          document.querySelectorAll('input[name="languages"]').forEach(cb => cb.checked = false);
+          updateSelection();
+        }
+        
+        function selectPopular() {
+          deselectAll();
+          const popular = ['en', 'es', 'fr', 'de', 'it', 'pt', 'ru', 'ja', 'ko', 'zh', 'ar', 'hi'];
+          popular.forEach(code => {
+            const checkbox = document.querySelector(\`input[value="\${code}"]\`);
+            if (checkbox) checkbox.checked = true;
+          });
+          updateSelection();
+        }
+        
+        searchInput.addEventListener('input', (e) => {
+          const searchTerm = e.target.value.toLowerCase();
+          languageLabels.forEach(label => {
+            const name = label.dataset.name;
+            const code = label.dataset.lang;
+            if (name.includes(searchTerm) || code.includes(searchTerm)) {
+              label.style.display = '';
+            } else {
+              label.style.display = 'none';
+            }
+          });
+        });
+        
+        updateSelection();
+      </script>
+    </body>
+    </html>
+  `);
+}
 
 /**
  * Handle configuration form submission
  */
-app.post('/stremio/:uuid/:encryptedConfig/configure', (req, res) => {
+app.post('/stremio/:uuid/:encryptedConfig/configure', async (req, res) => {
   const { uuid, encryptedConfig } = req.params;
+  const userId = uuid;
   
-  // Validate UUID format
-  if (!isValidUUID(uuid)) {
-    return res.status(400).send(generateErrorPage(
-      'Invalid Configuration',
-      'The configuration ID is invalid or malformed.'
+  // Check if this is a setup request
+  if (req.body.setup === '1') {
+    const password = req.body.password;
+    const confirmPassword = req.body.confirmPassword;
+    
+    if (password.length < 8) {
+      return res.send(generateSetupPage(uuid, encryptedConfig, 'Password must be at least 8 characters long.'));
+    }
+    
+    if (password !== confirmPassword) {
+      return res.send(generateSetupPage(uuid, encryptedConfig, 'Passwords do not match.'));
+    }
+    
+    const defaultConfig = {
+      languages: ['en'],
+      uuid: userId,
+      openrouter: {
+        apiKey: '',
+        referer: process.env.OPENROUTER_REFERER || ''
+      },
+      translation: {
+        enabled: false,
+        model: 'auto'
+      }
+    };
+    
+    try {
+      await saveUserConfig(userId, defaultConfig, password);
+      const sessionToken = unlockConfig(userId, defaultConfig, password);
+      
+      // Set session cookie
+      res.cookie(SESSION_COOKIE_NAME, sessionToken, {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === 'production',
+        sameSite: 'lax',
+        maxAge: SESSION_TIMEOUT
+      });
+      
+      res.redirect(`/stremio/${uuid}/${encryptedConfig}/configure`);
+      return;
+    } catch (error) {
+      return res.send(generateSetupPage(uuid, encryptedConfig, 'Error creating configuration.'));
+    }
+  }
+  
+  // Get password from request or from session
+  let password = req.body.password;
+  const sessionToken = getSessionToken(req);
+  const session = unlockedConfigs[sessionToken];
+  
+  // Check if we have a valid session (even if slightly expired, we'll refresh it)
+  const hasValidSession = session && session.userId === userId;
+  
+  // If no password provided but we have a valid session, use password from session
+  if ((!password || password.length === 0) && hasValidSession && session.password) {
+    password = session.password;
+    // Refresh the session expiration
+    session.expiresAt = Date.now() + SESSION_TIMEOUT;
+  }
+  
+  // If we still don't have a password and no valid session, require unlock
+  if ((!password || password.length === 0) && !hasValidSession) {
+    return res.status(403).send(generateErrorPage(
+      'Configuration Locked',
+      'Please unlock your configuration first by entering your password.'
     ));
   }
   
-  // Validate encrypted config if it's not 'new'
-  if (encryptedConfig && encryptedConfig !== 'new') {
-    const config = decryptConfig(encryptedConfig);
-    
-    // If decryption fails, return error
-    if (!config) {
-      return res.status(400).send(generateErrorPage(
-        'Invalid Configuration',
-        'The encrypted configuration is invalid or corrupted. Please create a new configuration.'
-      ));
-    }
-    
-    // Validate that the UUID in the decrypted config matches the URL UUID
-    if (config.uuid && config.uuid !== uuid) {
-      return res.status(400).send(generateErrorPage(
-        'Invalid Configuration',
-        'The configuration ID does not match. This configuration may belong to a different user.'
-      ));
-    }
+  // If still no password, require it
+  if (!password || password.length === 0) {
+    return res.status(400).send(generateErrorPage(
+      'Password Required',
+      'Please enter your password to save changes to your configuration.'
+    ));
   }
   
-  const userId = req.body.userId || req.body.uuid || uuid;
+  // Verify password by trying to load config
+  let passwordSalt;
+  try {
+    const fileExists = await configFileExists(userId);
+    if (!fileExists) {
+      return res.status(404).send(generateErrorPage(
+        'Configuration Not Found',
+        'Configuration file not found. Please set up a new configuration.'
+      ));
+    }
+    
+    // Try to load config to verify password
+    const testConfig = await loadUserConfig(userId, password);
+    // Get salt from file
+    const configPath = path.join(CONFIG_DIR, `${userId}.json`);
+    const fileData = JSON.parse(await fs.readFile(configPath, 'utf8'));
+    passwordSalt = fileData.passwordSalt;
+  } catch (error) {
+    if (error.message === 'Incorrect password' || error.message.includes('Decryption failed')) {
+      return res.status(401).send(generateErrorPage(
+        'Incorrect Password',
+        'The password you entered is incorrect. Please try again.'
+      ));
+    }
+    throw error;
+  }
   
-  // Handle both array (from checkboxes) and string (comma-separated) formats
+  // Validate UUID format
+  if (!isValidUUID(uuid)) {
+      return res.status(400).send(generateErrorPage(
+        'Invalid Configuration',
+      'The configuration ID is invalid or malformed.'
+      ));
+  }
+  
+  // Extract form data
   let languages = [];
   if (Array.isArray(req.body.languages)) {
     languages = req.body.languages.map(lang => lang.trim().toLowerCase()).filter(lang => lang.length > 0);
@@ -1882,12 +3255,11 @@ app.post('/stremio/:uuid/:encryptedConfig/configure', (req, res) => {
       .filter(lang => lang.length > 0);
   }
   
-  // Ensure at least English is selected
   if (languages.length === 0) {
     languages = ['en'];
   }
   
-  // Extract OpenRouter credentials from form
+  // Extract OpenRouter credentials
   const openrouterApiKey = (req.body.openrouterApiKey || '').trim();
   const openrouterReferer = (req.body.openrouterReferer || process.env.OPENROUTER_REFERER || '').trim();
   
@@ -1907,8 +3279,8 @@ app.post('/stremio/:uuid/:encryptedConfig/configure', (req, res) => {
     }
   }
   
-  // Store user preferences with UUID
-  userPreferences[userId] = {
+  // Build new config
+  const newConfig = {
     languages: languages,
     uuid: userId,
     updatedAt: new Date().toISOString(),
@@ -1922,19 +3294,55 @@ app.post('/stremio/:uuid/:encryptedConfig/configure', (req, res) => {
     }
   };
   
-  // Generate new encrypted config
-  const newConfig = encryptConfig({ 
-    uuid: userId, 
-    languages: languages,
-    openrouter: userPreferences[userId].openrouter,
-    translation: userPreferences[userId].translation
-  });
-  
-  console.log(`Saved preferences for user ${userId}:`, userPreferences[userId]);
-  console.log(`  Languages: ${languages.join(', ')}`);
-  console.log(`  OpenRouter API Key: ${openrouterApiKey ? '***' + openrouterApiKey.slice(-4) : 'Not set'}`);
-  
-  res.redirect(`/stremio/${uuid}/${newConfig}/configure?saved=true`);
+    // Save with password
+    try {
+      await saveUserConfig(userId, newConfig, password);
+      
+      // Update unlocked session (get or create new session token)
+      const sessionToken = getSessionToken(req) || unlockConfig(userId, newConfig);
+      if (!getSessionToken(req)) {
+        // Set session cookie if not already set
+        res.cookie(SESSION_COOKIE_NAME, sessionToken, {
+          httpOnly: true,
+          secure: process.env.NODE_ENV === 'production',
+          sameSite: 'lax',
+          maxAge: SESSION_TIMEOUT
+        });
+      } else {
+        // Update existing session (preserve password if it exists)
+        const existingSession = unlockedConfigs[sessionToken];
+        unlockedConfigs[sessionToken] = {
+          userId: userId,
+          config: newConfig,
+          password: existingSession?.password || password, // Preserve existing password or use new one
+          unlockedAt: existingSession?.unlockedAt || Date.now(),
+          expiresAt: Date.now() + SESSION_TIMEOUT
+        };
+      }
+      
+      // Generate new encrypted config for URL
+      const newEncryptedConfig = encryptConfig({ 
+        uuid: userId, 
+        languages: languages,
+        openrouter: newConfig.openrouter,
+        translation: newConfig.translation
+      });
+      
+      // Update in-memory cache for subtitle requests
+      userPreferences[userId] = newConfig;
+      
+      console.log(`✅ Saved configuration to file: configs/${userId}.json`);
+      console.log(`  Languages: ${languages.join(', ')}`);
+      console.log(`  OpenRouter API Key: ${openrouterApiKey ? '***' + openrouterApiKey.slice(-4) : 'Not set'}`);
+      
+      res.redirect(`/stremio/${uuid}/${newEncryptedConfig}/configure?saved=true`);
+    } catch (error) {
+      console.error('Error saving config:', error);
+      return res.status(500).send(generateErrorPage(
+        'Save Failed',
+        'An error occurred while saving your configuration. Please try again.'
+      ));
+    }
 });
 
 /**
@@ -1942,17 +3350,10 @@ app.post('/stremio/:uuid/:encryptedConfig/configure', (req, res) => {
  */
 app.get('/configure', (req, res) => {
   const newUuid = uuidv4();
+  // Don't create config file yet - user will set password on first visit
   const defaultConfig = {
     uuid: newUuid,
-    languages: ['en'],
-    openrouter: {
-      apiKey: '',  // User will configure
-      referer: process.env.OPENROUTER_REFERER || ''
-    },
-    translation: {
-      enabled: false,  // Disabled until user adds API key
-      model: 'auto'
-    }
+    languages: ['en']
   };
   const newConfig = encryptConfig(defaultConfig);
   res.redirect(`/stremio/${newUuid}/${newConfig}/configure`);
@@ -2006,19 +3407,36 @@ const subtitleHandler = async function(args) {
     const userId = userData?.userId || userData?.uuid || 'default';
     
     // Get user's full configuration
-    const userConfig = userPreferences[userId] || { 
-      languages: ['en'],
-      openrouter: {
-        apiKey: '',
-        referer: process.env.OPENROUTER_REFERER || ''
-      },
-      translation: {
-        enabled: false,
-        model: 'auto'
-      }
-    };
+    // For subtitle requests, we use cached config or default (no password required)
+    let userConfig = null;
     
-    const preferredLanguages = getUserLanguages({ userData: { userId } });
+    // Try to get from unlocked session (if user recently accessed config page)
+    // Note: For subtitle requests, we can't use req object, so we'll use a fallback
+    // Subtitle requests don't require password (read-only access)
+    // We'll use the in-memory cache or default config
+    
+    // Fallback to in-memory cache
+    if (!userConfig && userPreferences[userId]) {
+      userConfig = userPreferences[userId];
+    }
+    
+    // Use default if neither available
+    if (!userConfig) {
+      userConfig = { 
+        languages: ['en'],
+        openrouter: {
+          apiKey: '',
+          referer: process.env.OPENROUTER_REFERER || ''
+        },
+        translation: {
+          enabled: false,
+          model: 'auto'
+        }
+      };
+    }
+    
+    // Use languages from the loaded config (not from getUserLanguages which uses old cache)
+    const preferredLanguages = userConfig.languages || ['en'];
     
     // Always include English first, then user's preferred languages
     const allLanguages = ['en', ...preferredLanguages.filter(lang => lang !== 'en')];
@@ -2027,7 +3445,7 @@ const subtitleHandler = async function(args) {
     console.log(`\n🔍 Processing subtitle request for ${type}/${id} (season: ${season}, episode: ${episode})`);
     console.log(`👤 User ID: ${userId}`);
     console.log(`🌐 User preferred languages: ${preferredLanguages.join(', ')}`);
-    console.log(`🔑 OpenRouter API Key: ${userConfig.openrouter?.apiKey ? 'Configured (User)' : process.env.OPENROUTER_API_KEY ? 'Using server key (fallback)' : 'Not configured'}`);
+    console.log(`🔑 OpenRouter API Key: ${userConfig.openrouter?.apiKey ? 'Configured' : 'Not configured - translation will fail'}`);
     console.log(`📋 Processing languages: ${allLanguages.join(', ')}`);
     
     for (const lang of allLanguages) {
@@ -2119,7 +3537,7 @@ const subtitleHandler = async function(args) {
                 const baseUrl = process.env.BASE_URL || `http://${req?.get?.('host') || 'localhost:7001'}`;
                 console.error(`   Visit: ${baseUrl}/configure`);
               } else {
-                console.error(`Error translating to ${lang}:`, translationError.message);
+              console.error(`Error translating to ${lang}:`, translationError.message);
               }
               // Continue with other languages
             }
@@ -2247,14 +3665,37 @@ app.get('/stremio/:uuid/:encryptedConfig/subtitles/:type/:id*.json', async (req,
     
     // Decrypt config to get user preferences
     let userId = uuid;
+    let decryptedUrlConfig = null;
     if (encryptedConfig && encryptedConfig !== 'new') {
-      const config = decryptConfig(encryptedConfig);
-      if (config) {
-        userId = config.uuid || uuid;
-        console.log(`Decrypted config - User ID: ${userId}, Languages: ${config.languages?.join(', ')}`);
+      decryptedUrlConfig = decryptConfig(encryptedConfig);
+      if (decryptedUrlConfig) {
+        userId = decryptedUrlConfig.uuid || uuid;
+        console.log(`Decrypted config from URL - User ID: ${userId}, Languages: ${decryptedUrlConfig.languages?.join(', ')}`);
       } else {
         console.log('⚠️  Could not decrypt config, using UUID');
       }
+    }
+    
+    // Try to load from file-based config cache (if available)
+    // This ensures we use the latest saved config, not the old URL-encrypted one
+    // Only use URL config as fallback if cache doesn't exist
+    if (!userPreferences[userId] && decryptedUrlConfig) {
+      // Fallback to URL config if cache not available
+      userPreferences[userId] = {
+        languages: decryptedUrlConfig.languages || ['en'],
+        uuid: userId,
+        openrouter: decryptedUrlConfig.openrouter || {
+          apiKey: '',
+          referer: process.env.OPENROUTER_REFERER || ''
+        },
+        translation: decryptedUrlConfig.translation || {
+          enabled: false,
+          model: 'auto'
+        }
+      };
+      console.log(`Using URL config (fallback) - Languages: ${userPreferences[userId].languages?.join(', ')}`);
+    } else if (userPreferences[userId]) {
+      console.log(`Using cached config - Languages: ${userPreferences[userId].languages?.join(', ')}`);
     }
     
     // Parse season/episode from ID if present (format: tt0903747:1:1)
@@ -2321,6 +3762,18 @@ app.get('/subtitles/:type/:id.json', async (req, res) => {
   const newConfig = encryptConfig({ uuid: newUuid, languages: ['en'] });
   res.redirect(`/stremio/${newUuid}/${newConfig}/subtitles/${req.params.type}/${req.params.id}.json`);
 });
+
+// Initialize configs directory and load config count
+(async () => {
+  try {
+    await ensureConfigDir();
+    const count = await loadAllConfigs();
+    console.log(`📁 Configuration directory ready: ${CONFIG_DIR}`);
+  } catch (error) {
+    console.error('Error initializing configs directory:', error);
+    console.log('Server will continue, but config saving may fail');
+  }
+})();
 
 // Start server
 const server = app.listen(port, () => {
