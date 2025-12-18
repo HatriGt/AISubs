@@ -11,8 +11,8 @@ COPY package.json ./
 COPY bun.lock* ./
 
 # Install dependencies using bun
-# Use --frozen-lockfile if bun.lock exists, otherwise install normally
-RUN if [ -f bun.lock ]; then bun install --frozen-lockfile; else bun install; fi
+# Note: If bun.lock is out of sync, bun will update it automatically
+RUN bun install
 
 # Copy application files
 COPY . .
