@@ -3345,6 +3345,10 @@ app.post('/stremio/:uuid/:encryptedConfig/configure', async (req, res) => {
     }
 });
 
+app.get('/', (req, res) => {
+  res.redirect('/configure');
+});
+
 app.get('/configure', (req, res) => {
   const newUuid = uuidv4();
   const defaultConfig = {
