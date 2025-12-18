@@ -3457,20 +3457,24 @@ app.post('/stremio/:uuid/:encryptedConfig/configure', async (req, res) => {
     ));
   }
   
-  let passwordSalt;
+  // Verify password by loading config (works with both database and file system)
   try {
     const fileExists = await configFileExists(userId);
     if (!fileExists) {
       return res.status(404).send(generateErrorPage(
         'Configuration Not Found',
-        'Configuration file not found. Please set up a new configuration.'
+        'Configuration not found. Please set up a new configuration.'
       ));
     }
     
+    // This verifies the password and loads the config
     const testConfig = await loadUserConfig(userId, password);
-    const configPath = path.join(CONFIG_DIR, `${userId}.json`);
-    const fileData = JSON.parse(await fs.readFile(configPath, 'utf8'));
-    passwordSalt = fileData.passwordSalt;
+    if (!testConfig) {
+      return res.status(404).send(generateErrorPage(
+        'Configuration Not Found',
+        'Configuration not found. Please set up a new configuration.'
+      ));
+    }
   } catch (error) {
     if (error.message === 'Incorrect password' || error.message.includes('Decryption failed')) {
       return res.status(401).send(generateErrorPage(
