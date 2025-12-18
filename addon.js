@@ -10,6 +10,9 @@ require('dotenv').config();
 
 const app = express();
 
+// Trust proxy for correct HTTPS detection on Render and other cloud platforms
+app.set('trust proxy', true);
+
 app.use((req, res, next) => {
   if (req.path.includes('subtitles') || req.path.includes('manifest') || req.path.includes('configure')) {
     console.log(`\n${req.method} ${req.path}`);
@@ -3628,6 +3631,14 @@ builder.defineSubtitlesHandler(subtitleHandler);
 
 const port = process.env.PORT || 7001;
 
+// Handle CORS preflight requests for manifest endpoint
+app.options('/stremio/:uuid/:encryptedConfig/manifest.json', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.status(204).end();
+});
+
 app.get('/stremio/:uuid/:encryptedConfig/manifest.json', async (req, res) => {
   try {
     const { uuid, encryptedConfig } = req.params;
@@ -3655,13 +3666,22 @@ app.get('/stremio/:uuid/:encryptedConfig/manifest.json', async (req, res) => {
     };
     
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
     res.setHeader('Content-Type', 'application/json');
     res.json(manifestData);
   } catch (error) {
     console.error('Error serving manifest:', error);
     res.status(500).json({ error: 'Failed to serve manifest' });
   }
+});
+
+// Handle CORS preflight requests for subtitles endpoint
+app.options('/stremio/:uuid/:encryptedConfig/subtitles/:type/:id*.json', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.status(204).end();
 });
 
 app.get('/stremio/:uuid/:encryptedConfig/subtitles/:type/:id*.json', async (req, res) => {
@@ -3775,13 +3795,23 @@ app.get('/stremio/:uuid/:encryptedConfig/subtitles/:type/:id*.json', async (req,
     console.log('=== END SUBTITLE REQUEST ===\n');
     
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    res.setHeader('Content-Type', 'application/json');
     res.json(result);
   } catch (error) {
     console.error('Error serving subtitles:', error);
     console.error('Stack:', error.stack);
     res.status(500).json({ error: 'Failed to serve subtitles', message: error.message });
   }
+});
+
+// Handle CORS preflight for root manifest
+app.options('/manifest.json', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.status(204).end();
 });
 
 app.get('/manifest.json', async (req, res) => {
