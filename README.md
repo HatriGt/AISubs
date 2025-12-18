@@ -1,187 +1,394 @@
-# Stremio AI Subtitle Translator Addon
+# Stremio AI Subtitle Translator
 
-A Stremio addon that provides AI-translated subtitles using OpenRouter (supports multiple AI models including Llama, Gemma, and Mistral). The addon fetches subtitles from wyzie-lib and translates them using AI when subtitles in the requested language are not available.
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
+A Stremio addon that provides AI-powered subtitle translation using OpenRouter. Automatically translates subtitles to your preferred languages when native subtitles are unavailable, supporting multiple AI models including Llama, Gemma, and Mistral.
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Features](#features)
+- [Prerequisites](#prerequisites)
+- [Quick Start](#quick-start)
+- [Installation](#installation)
+- [Configuration](#configuration)
+- [Usage](#usage)
+- [Docker Deployment](#docker-deployment)
+- [Architecture](#architecture)
+- [API Reference](#api-reference)
+- [Development](#development)
+- [Troubleshooting](#troubleshooting)
+- [Security](#security)
+- [License](#license)
+
+## Overview
+
+Stremio AI Subtitle Translator is an intelligent addon that enhances your Stremio experience by providing multilingual subtitle support. When subtitles in your preferred language are not available, the addon automatically fetches English subtitles from wyzie-lib and translates them using state-of-the-art AI models via OpenRouter.
+
+### Key Capabilities
+
+- **Multi-language Support**: Configure unlimited preferred languages
+- **Intelligent Fallback**: Automatic translation when native subtitles are unavailable
+- **High Performance**: Optimized parallel processing with intelligent chunking
+- **Multiple AI Models**: Automatic model selection with rate limit management
+- **Secure Configuration**: Password-protected, encrypted user settings
 
 ## Features
 
-- **Multi-language Support**: Configure your preferred subtitle languages
-- **Smart Fallback**: Automatically fetches English subtitles and translates them using AI when subtitles in your preferred language aren't available
-- **wyzie-lib Integration**: Uses wyzie-lib to search for existing subtitles in various languages
-- **Configuration Page**: Easy-to-use web interface for selecting preferred languages
-- **VTT Format**: Converts subtitles to VTT format for Stremio compatibility
-- **Intelligent Chunking**: Optimized parallel processing with rate limiting for fast translations
-- **Multiple AI Models**: Automatically selects the best available model from OpenRouter (Llama, Gemma, Mistral)
+### Core Functionality
+
+- ✅ **Multi-language Support**: Configure your preferred subtitle languages using ISO 639-1 codes
+- ✅ **Smart Fallback System**: Automatically fetches and translates English subtitles when needed
+- ✅ **wyzie-lib Integration**: Seamless integration with wyzie-lib for subtitle discovery
+- ✅ **VTT Format Conversion**: Native Stremio-compatible subtitle format
+- ✅ **Web Configuration Interface**: User-friendly configuration page for settings management
+
+### Advanced Features
+
+- 🚀 **Intelligent Chunking**: Optimized subtitle processing with parallel execution
+- 🤖 **Multi-Model AI Support**: Automatic selection from Llama, Gemma, and Mistral models
+- 🔒 **Secure Storage**: Password-protected, encrypted configuration files
+- ⚡ **Rate Limit Management**: Built-in handling of API rate limits
+- 📦 **Docker Support**: Production-ready containerized deployment
 
 ## Prerequisites
 
-- Node.js (v14 or higher) or Bun
-- OpenRouter API key ([Get one here](https://openrouter.ai/keys))
+### System Requirements
+
+- **Node.js**: v14 or higher, or **Bun** (recommended)
+- **OpenRouter API Key**: [Get your API key here](https://openrouter.ai/keys)
+
+### Required Services
+
+- OpenRouter account with API access
+- Network access to wyzie-lib subtitle service
+
+## Quick Start
+
+### Local Development
+
+```bash
+# Clone the repository
+git clone <repository-url>
+cd AISubs
+
+# Install dependencies
+bun install
+
+# Create environment file
+cp .env.sample .env
+# Edit .env with your settings
+
+# Generate MASTER_KEY
+openssl rand -hex 32
+# Add the generated key to .env
+
+# Start the server
+bun start
+```
+
+### Docker Deployment
+
+```bash
+# Clone and navigate
+git clone <repository-url>
+cd AISubs
+
+# Create .env file
+cp .env.sample .env
+# Configure your settings
+
+# Start with Docker Compose
+docker-compose up -d
+```
+
+Access the configuration page at `http://localhost:7001/configure`
 
 ## Installation
 
-1. Clone or download this repository
+### Step 1: Clone Repository
 
-2. Install dependencies:
+```bash
+git clone <repository-url>
+cd AISubs
+```
+
+### Step 2: Install Dependencies
+
 ```bash
 bun install
 # or
 npm install
 ```
 
-3. Create a `.env` file in the root directory:
+### Step 3: Environment Configuration
+
+Create a `.env` file in the root directory:
+
 ```env
 PORT=7001
 BASE_URL=http://127.0.0.1:7001
 MASTER_KEY=your_master_key_here_32_bytes_hex
 ```
 
-**Note on MASTER_KEY**: This is used to encrypt public configs (languages and API keys) for read-only access without passwords. If not set, a random key is generated on each restart, which means configs won't persist across restarts. For production, generate a secure 32-byte hex key:
+#### Generating MASTER_KEY
+
+The `MASTER_KEY` is used to encrypt public configurations for read-only access. Generate a secure 32-byte hex key:
+
 ```bash
 openssl rand -hex 32
 ```
 
-**Important**: Each user must configure their own OpenRouter API key in the addon's configuration page. The server does NOT provide a fallback API key.
+**Important**: Without a `MASTER_KEY`, configurations won't persist across server restarts. Always set this in production.
 
-4. Get your OpenRouter API key:
-   - Visit [OpenRouter](https://openrouter.ai/keys)
-   - Create a new API key
-   - Add it in the addon's configuration page (not in `.env`)
-   - The referer field is optional but recommended
+### Step 4: Start the Server
 
-## Docker Deployment
-
-### Quick Start with Docker
-
-1. Clone the repository:
-```bash
-git clone <repo-url>
-cd AISubs
-```
-
-2. Create a `.env` file from the template:
-```bash
-cp .env.sample .env
-# Edit .env with your settings
-```
-
-3. Generate a secure MASTER_KEY:
-```bash
-openssl rand -hex 32
-```
-Add this to your `.env` file.
-
-4. Start with Docker Compose:
-```bash
-docker-compose up -d
-```
-
-5. Access the service:
-   - Configuration page: `http://localhost:7001/configure`
-   - Manifest URL: `http://localhost:7001/manifest.json`
-   - Health check: `http://localhost:7001/health`
-
-### Docker Commands
-
-- **Build image**: `npm run docker:build` or `docker build -t aisubs .`
-- **Start container**: `npm run docker:run` or `docker-compose up -d`
-- **Stop container**: `npm run docker:stop` or `docker-compose down`
-- **View logs**: `npm run docker:logs` or `docker-compose logs -f`
-- **Restart container**: `npm run docker:restart` or `docker-compose restart`
-
-### Docker Configuration
-
-The Docker setup includes:
-- **Health checks**: Automatic health monitoring via `/health` endpoint
-- **Volume persistence**: Configuration files are persisted in `./configs` directory
-- **Auto-restart**: Container automatically restarts unless stopped
-- **Port mapping**: Default port 7001 (configurable via `PORT` environment variable)
-
-### Environment Variables for Docker
-
-All environment variables from `.env` are automatically passed to the container:
-- `PORT`: Server port (default: 7001)
-- `BASE_URL`: Base URL for the addon
-- `MASTER_KEY`: Encryption key (32-byte hex string)
-- `OPENROUTER_API_KEY`: Optional fallback API key
-- `OPENROUTER_REFERER`: Optional referer string
-
-## Usage
-
-1. Start the addon:
 ```bash
 bun start
 # or
 npm start
 ```
 
-2. The addon will output:
-   - Addon manifest URL: `http://127.0.0.1:7001/manifest.json`
-   - Configuration page: `http://127.0.0.1:7001/configure`
+The server will output:
+- Manifest URL: `http://127.0.0.1:7001/manifest.json`
+- Configuration page: `http://127.0.0.1:7001/configure`
 
-3. Configure your preferred languages:
-   - Visit the configuration page
-   - Enter comma-separated language codes (e.g., `ta,te,hi,es,fr,de,it,pt,ja,ko,zh`)
-   - Click "Save Configuration"
+### Step 5: Configure OpenRouter API Key
 
-4. Install in Stremio:
-   - Open Stremio
-   - Go to Addons
-   - Click "Add Addon"
-   - Paste the manifest URL: `http://127.0.0.1:7001/manifest.json`
+1. Visit the configuration page: `http://127.0.0.1:7001/configure`
+2. Create a password (minimum 8 characters) for your configuration
+3. Enter your OpenRouter API key in the configuration interface
+4. Configure your preferred languages (comma-separated ISO 639-1 codes)
+5. Save your configuration
 
-## How It Works
+**Note**: Each user must configure their own OpenRouter API key. The server does not provide a fallback API key.
 
-1. When Stremio requests subtitles for a movie or TV show, the addon:
-   - Checks your preferred languages from the configuration
-   - Searches wyzie-lib for subtitles in each preferred language
-   - If found, serves them directly
-   - If not found, fetches English subtitles and translates them using AI via OpenRouter
-   - Converts all subtitles to VTT format for Stremio
+### Step 6: Install in Stremio
 
-2. The addon always includes English subtitles as a fallback
+1. Open Stremio application
+2. Navigate to **Addons**
+3. Click **Add Addon**
+4. Paste the manifest URL: `http://127.0.0.1:7001/manifest.json`
+5. The addon will appear in your addons list
 
-3. **Intelligent Translation**:
-   - Automatically selects the best available AI model
-   - Splits large subtitle files into optimized chunks
-   - Processes chunks in parallel (respecting rate limits)
-   - Cleans AI output to remove commentary and instructions
+## Configuration
 
-## Language Codes
+### User Configuration
 
-Use ISO 639-1 language codes (2-letter codes):
-- `en` - English
-- `ta` - Tamil
-- `te` - Telugu
-- `hi` - Hindi
-- `es` - Spanish
-- `fr` - French
-- `de` - German
-- `it` - Italian
-- `pt` - Portuguese
-- `ja` - Japanese
-- `ko` - Korean
-- `zh` - Chinese
-- And many more...
+Access the configuration page at `http://localhost:7001/configure` to manage:
 
-## Supported Media Types
+- **Preferred Languages**: Comma-separated ISO 639-1 language codes
+  - Example: `ta,te,hi,es,fr,de,it,pt,ja,ko,zh`
+- **OpenRouter API Key**: Your personal API key from OpenRouter
+- **HTTP Referer**: Optional referer string for API requests
+- **Translation Model**: Preferred AI model (optional, auto-selected if not specified)
 
-- Movies (IMDB IDs: `tt1234567`, TMDB IDs: `tmdb:123456`)
-- TV Series (with season and episode support)
+### Environment Variables
+
+| Variable | Description | Required | Default |
+|----------|-------------|----------|---------|
+| `PORT` | Server port number | No | `7001` |
+| `BASE_URL` | Base URL for the addon | No | `http://127.0.0.1:7001` |
+| `MASTER_KEY` | 32-byte hex encryption key | Yes (production) | Random (non-persistent) |
+| `OPENROUTER_API_KEY` | Fallback API key | No | None |
+| `OPENROUTER_REFERER` | Default referer string | No | None |
+
+### Supported Language Codes
+
+Use ISO 639-1 two-letter language codes:
+
+| Code | Language | Code | Language |
+|------|----------|------|----------|
+| `en` | English | `ta` | Tamil |
+| `te` | Telugu | `hi` | Hindi |
+| `es` | Spanish | `fr` | French |
+| `de` | German | `it` | Italian |
+| `pt` | Portuguese | `ja` | Japanese |
+| `ko` | Korean | `zh` | Chinese |
+
+[Full list of ISO 639-1 codes](https://en.wikipedia.org/wiki/List_of_ISO_639-1_codes)
+
+### Supported Media Types
+
+- **Movies**: IMDB IDs (`tt1234567`) and TMDB IDs (`tmdb:123456`)
+- **TV Series**: Full season and episode support
+
+### AI Models
+
+The addon automatically selects from available models in priority order:
+
+| Model | Rate Limit | Priority |
+|-------|------------|----------|
+| `meta-llama/llama-3.1-8b-instruct` | 60 RPM, 1M TPM | 1 |
+| `google/gemma-2-9b-it` | 60 RPM, 1M TPM | 2 |
+| `google/gemma-2-2b-it` | 60 RPM, 1M TPM | 3 |
+| `google/gemma-2-1.1b-it` | 60 RPM, 1M TPM | 4 |
+| `mistralai/mistral-7b-instruct` | 60 RPM, 1M TPM | 5 |
+
+## Usage
+
+### Basic Workflow
+
+1. **Start the Server**: Run `bun start` or `npm start`
+2. **Configure Languages**: Visit the configuration page and set your preferred languages
+3. **Watch Content**: Play any movie or TV show in Stremio
+4. **Automatic Translation**: The addon automatically:
+   - Searches for subtitles in your preferred languages
+   - Falls back to English subtitles if not found
+   - Translates English subtitles using AI
+   - Serves translated subtitles in VTT format
+
+### How It Works
+
+```
+┌─────────────────┐
+│  Stremio Request│
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│ Check Preferred │
+│   Languages     │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐      Yes      ┌──────────────┐
+│ Search wyzie-lib│ ────────────► │ Serve Native │
+│  for Subtitles  │                │  Subtitles   │
+└────────┬────────┘                └──────────────┘
+         │ No
+         ▼
+┌─────────────────┐
+│ Fetch English   │
+│   Subtitles     │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│  AI Translation │
+│  via OpenRouter │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│ Convert to VTT  │
+│  and Serve      │
+└─────────────────┘
+```
+
+### Translation Process
+
+1. **Subtitle Discovery**: Searches wyzie-lib for subtitles in preferred languages
+2. **Fallback Mechanism**: If not found, fetches English subtitles
+3. **Intelligent Chunking**: Splits large subtitle files into optimized chunks
+4. **Parallel Processing**: Processes chunks concurrently with rate limit management
+5. **AI Translation**: Translates each chunk using the best available AI model
+6. **Output Cleaning**: Removes AI commentary and instructions from translations
+7. **Format Conversion**: Converts to VTT format for Stremio compatibility
+
+## Docker Deployment
+
+### Quick Start
+
+```bash
+# Clone repository
+git clone <repository-url>
+cd AISubs
+
+# Create environment file
+cp .env.sample .env
+# Edit .env with your settings
+
+# Generate MASTER_KEY
+openssl rand -hex 32
+# Add to .env
+
+# Start services
+docker-compose up -d
+```
+
+### Docker Commands
+
+| Command | Description |
+|---------|-------------|
+| `npm run docker:build` | Build Docker image |
+| `npm run docker:run` | Start container |
+| `npm run docker:stop` | Stop container |
+| `npm run docker:logs` | View container logs |
+| `npm run docker:restart` | Restart container |
+
+### Docker Features
+
+- **Health Checks**: Automatic monitoring via `/health` endpoint
+- **Volume Persistence**: Configurations stored in `./configs` directory
+- **Auto-restart**: Container restarts automatically unless stopped
+- **Port Mapping**: Configurable via `PORT` environment variable
+
+### Docker Environment Variables
+
+All variables from `.env` are automatically passed to the container. See [Configuration](#configuration) for details.
+
+### Access Points
+
+- **Configuration Page**: `http://localhost:7001/configure`
+- **Manifest URL**: `http://localhost:7001/manifest.json`
+- **Health Check**: `http://localhost:7001/health`
+
+## Architecture
+
+### System Components
+
+- **stremio-addon-sdk**: Core SDK for Stremio addon functionality
+- **wyzie-lib**: Subtitle fetching and discovery library
+- **express**: HTTP server framework
+- **axios**: HTTP client for OpenRouter API integration
+- **OpenRouter**: Unified API gateway for multiple AI models
+
+### Data Flow
+
+1. **Request Handling**: Express server receives Stremio subtitle requests
+2. **Configuration Lookup**: Retrieves user preferences from encrypted config files
+3. **Subtitle Search**: Queries wyzie-lib for available subtitles
+4. **Translation Pipeline**: Processes translations through OpenRouter API
+5. **Response Formatting**: Converts and serves subtitles in VTT format
+
+## API Reference
+
+### Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/manifest.json` | GET | Stremio addon manifest |
+| `/configure` | GET | Configuration web interface |
+| `/health` | GET | Health check endpoint |
+| `/subtitles/:type/:id/:extra` | GET | Subtitle retrieval endpoint |
+
+### Health Check
+
+```bash
+curl http://localhost:7001/health
+```
+
+Returns server status and version information.
 
 ## Development
 
-The addon uses:
-- **stremio-addon-sdk**: Core SDK for Stremio addons
-- **wyzie-lib**: Subtitle fetching library
-- **express**: HTTP server
-- **axios**: HTTP client for OpenRouter API
-- **OpenRouter**: Unified API for multiple AI models (Llama, Gemma, Mistral)
+### Project Structure
+
+```
+AISubs/
+├── addon.js              # Main addon server
+├── test-endpoints.js     # Endpoint testing script
+├── test-movie.js         # Full movie translation test
+├── configs/              # Encrypted user configurations
+├── package.json          # Dependencies and scripts
+└── README.md             # This file
+```
 
 ### Testing
 
-Run test scripts:
 ```bash
-# Test endpoints
+# Test all endpoints
 bun test
 # or
 npm test
@@ -192,65 +399,97 @@ bun run test:movie
 npm run test:movie
 ```
 
-## Configuration
+### Development Dependencies
 
-### OpenRouter API Key Configuration
-
-Each user must configure their own OpenRouter API key through the configuration page:
-
-1. Visit the configuration page after starting the server
-2. Enter your OpenRouter API key in the "OpenRouter API Configuration" section
-3. Optionally configure HTTP Referer and preferred translation model
-4. Save the configuration
-
-**Note**: The server-side `OPENROUTER_API_KEY` environment variable is optional and only used as a fallback if a user hasn't configured their own key. For production use, each user should provide their own API key.
-
-### Environment Variables
-
-- `PORT`: Server port (default: 7001)
-- `OPENROUTER_API_KEY`: OpenRouter API key (optional - fallback only, users should configure their own)
-- `OPENROUTER_REFERER`: Your app name or URL (optional - used as default if user doesn't specify)
-- `BASE_URL`: Base URL for the addon (default: http://127.0.0.1:7001)
-
-### AI Models
-
-The addon automatically selects from these models (in priority order):
-1. `meta-llama/llama-3.1-8b-instruct` (60 RPM, 1M TPM)
-2. `google/gemma-2-9b-it` (60 RPM, 1M TPM)
-3. `google/gemma-2-2b-it` (60 RPM, 1M TPM)
-4. `google/gemma-2-1.1b-it` (60 RPM, 1M TPM)
-5. `mistralai/mistral-7b-instruct` (60 RPM, 1M TPM)
+- Node.js v14+ or Bun
+- OpenRouter API key for testing
+- Network access to wyzie-lib
 
 ## Troubleshooting
 
-- **No subtitles appearing**: Check that wyzie-lib can find subtitles for the media, and that your OpenRouter API key is valid
-- **Translation not working**: Ensure you have configured your OpenRouter API key in the configuration page. The server-side `OPENROUTER_API_KEY` is optional and only used as a fallback.
-- **Configuration not saving**: Check that the server is running and accessible
-- **Rate limit errors**: The addon automatically handles rate limits, but if you see errors, check your OpenRouter quota
+### Common Issues
+
+#### No Subtitles Appearing
+
+**Symptoms**: Subtitles don't appear in Stremio
+
+**Solutions**:
+1. Verify wyzie-lib can find subtitles for the media
+2. Check that your OpenRouter API key is valid and configured
+3. Ensure the addon is properly installed in Stremio
+4. Check server logs for error messages
+
+#### Translation Not Working
+
+**Symptoms**: Subtitles appear but are not translated
+
+**Solutions**:
+1. Verify OpenRouter API key is configured in the configuration page
+2. Check your OpenRouter account quota and limits
+3. Ensure preferred languages are correctly configured
+4. Review server logs for API errors
+
+#### Configuration Not Saving
+
+**Symptoms**: Settings don't persist after saving
+
+**Solutions**:
+1. Verify `MASTER_KEY` is set in `.env` file
+2. Check file permissions on `configs/` directory
+3. Ensure server has write access to the configuration directory
+4. Verify password was entered correctly when saving
+
+#### Rate Limit Errors
+
+**Symptoms**: API rate limit errors in logs
+
+**Solutions**:
+1. The addon automatically handles rate limits, but check your OpenRouter quota
+2. Consider upgrading your OpenRouter plan for higher limits
+3. Reduce the number of concurrent translation requests
+
+### Debug Mode
+
+Enable verbose logging by checking server console output. All operations are logged with timestamps and error details.
+
+## Security
 
 ### Password Protection
 
 Each user configuration is protected with a password:
 
-1. **First Time Setup**: When you first visit the configuration page, you'll be prompted to create a password (minimum 8 characters)
-2. **Unlocking**: Each time you visit the configuration page, you'll need to enter your password to unlock and modify settings
-3. **Session**: Once unlocked, your configuration remains accessible for 30 minutes without re-entering the password
-4. **Saving Changes**: When saving configuration changes, you must re-enter your password for security
-5. **Password Recovery**: If you forget your password, you'll need to create a new configuration (old settings cannot be recovered)
+1. **Initial Setup**: Create a password (minimum 8 characters) on first visit
+2. **Unlocking**: Enter password to access and modify settings
+3. **Session Duration**: Configuration remains unlocked for 30 minutes
+4. **Saving Changes**: Password required to save modifications
+5. **Password Recovery**: Not supported - create new configuration if forgotten
 
-**Security Notes**:
-- Your password is never stored in plain text - only a secure hash (PBKDF2 with 100,000 iterations) is saved
-- Configuration files are encrypted with your password using AES-256-CBC
-- Each configuration file is independently encrypted with its own password
-- Passwords are required to modify settings, but not to use the addon (read-only access for subtitle requests)
-- Configuration files have restricted permissions (600 - owner read/write only)
+### Security Features
 
-## Notes
+- **Password Hashing**: PBKDF2 with 100,000 iterations
+- **Encryption**: AES-256-CBC for configuration files
+- **File Permissions**: Restricted to owner only (600)
+- **Independent Encryption**: Each configuration file encrypted separately
+- **Read-Only Access**: Subtitle requests don't require password
 
-- User configurations are stored in encrypted files in the `configs/` directory and persist across server restarts
-- Subtitle content is cached in memory for serving
-- The addon uses intelligent chunking and parallel processing for optimal translation speed
+### Security Best Practices
+
+1. **MASTER_KEY**: Always use a secure, randomly generated key in production
+2. **API Keys**: Never share your OpenRouter API key
+3. **Network Security**: Use HTTPS in production environments
+4. **File Permissions**: Ensure `configs/` directory has restricted access
+5. **Regular Updates**: Keep dependencies updated for security patches
+
+### Data Storage
+
+- **Configuration Files**: Stored in `configs/` directory with encryption
+- **Subtitle Cache**: In-memory cache for performance (not persisted)
+- **No User Data**: No personal information is stored or transmitted
 
 ## License
 
-MIT
+This project is licensed under the MIT License - see the LICENSE file for details.
+
+---
+
+**Note**: This addon requires each user to provide their own OpenRouter API key. The server does not provide a shared API key for security and quota management reasons.
