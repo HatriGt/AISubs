@@ -490,7 +490,9 @@ function unlockConfig(userId, config, password = null) {
   unlockedConfigs[sessionToken] = {
     userId: userId,
     config: config,
-    password: password, // Store password temporarily for saving without re-entering
+    // Password stored temporarily in memory for session duration (30 min max) to allow saving without re-entry
+    // This is a security trade-off for UX - password is never logged or exposed in URLs
+    password: password,
     unlockedAt: Date.now(),
     expiresAt: Date.now() + SESSION_TIMEOUT
   };
@@ -1393,14 +1395,33 @@ function isValidUUID(uuid) {
   return uuidRegex.test(uuid);
 }
 
+/**
+ * Escape HTML to prevent XSS attacks
+ */
+function escapeHtml(text) {
+  if (typeof text !== 'string') {
+    return '';
+  }
+  const map = {
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#039;'
+  };
+  return text.replace(/[&<>"']/g, m => map[m]);
+}
+
 function generateErrorPage(title, message) {
+  const safeTitle = escapeHtml(title);
+  const safeMessage = escapeHtml(message);
   return `
     <!DOCTYPE html>
     <html lang="en">
     <head>
       <meta charset="UTF-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>${title} - AI Subtitle Translator</title>
+      <title>${safeTitle} - AI Subtitle Translator</title>
       <script src="https://cdn.tailwindcss.com"></script>
       <script>
         tailwind.config = {
@@ -1511,8 +1532,8 @@ function generateErrorPage(title, message) {
                   <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path>
                 </svg>
               </div>
-              <h1 class="text-2xl sm:text-3xl font-semibold text-[hsl(var(--foreground))] mb-2">${title}</h1>
-              <p class="text-[hsl(var(--muted-foreground))] text-sm sm:text-base mb-6">${message}</p>
+              <h1 class="text-2xl sm:text-3xl font-semibold text-[hsl(var(--foreground))] mb-2">${safeTitle}</h1>
+              <p class="text-[hsl(var(--muted-foreground))] text-sm sm:text-base mb-6">${safeMessage}</p>
               <a 
                 href="/configure" 
                 class="inline-flex items-center justify-center px-5 py-2.5 text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg shadow-sm transition-all hover:shadow-md focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 focus:ring-offset-[hsl(var(--background))]"
@@ -1572,7 +1593,7 @@ function generateSetupPage(uuid, encryptedConfig, errorMessage = null) {
     
     ${errorMessage ? `
       <div class="bg-red-900/20 border border-red-700/50 rounded-md p-3 mb-4">
-        <p class="text-red-200 text-sm">${errorMessage}</p>
+        <p class="text-red-200 text-sm">${escapeHtml(errorMessage)}</p>
       </div>
     ` : ''}
     
@@ -1661,12 +1682,11 @@ function generateUnlockPage(uuid, encryptedConfig, errorMessage = null) {
     
     ${errorMessage ? `
       <div class="bg-red-900/20 border border-red-700/50 rounded-md p-3 mb-4">
-        <p class="text-red-200 text-sm">${errorMessage}</p>
+        <p class="text-red-200 text-sm">${escapeHtml(errorMessage)}</p>
       </div>
     ` : ''}
     
-    <form method="GET" action="/stremio/${uuid}/${encryptedConfig}/configure">
-      <input type="hidden" name="unlock" value="1">
+    <form method="POST" action="/stremio/${uuid}/${encryptedConfig}/unlock">
       
       <div class="mb-6">
         <label for="password" class="block text-sm font-medium mb-2">
@@ -1705,7 +1725,6 @@ function generateUnlockPage(uuid, encryptedConfig, errorMessage = null) {
  */
 app.get('/stremio/:uuid/:encryptedConfig/configure', async (req, res) => {
   const { uuid, encryptedConfig } = req.params;
-  const { unlock } = req.query;
   
   // Validate UUID format
   if (!isValidUUID(uuid)) {
@@ -1725,38 +1744,7 @@ app.get('/stremio/:uuid/:encryptedConfig/configure', async (req, res) => {
     return renderConfigPage(req, res, userId, uuid, encryptedConfig, currentPrefs);
   }
   
-  // Handle unlock attempt
-  if (unlock === '1' && req.query.password) {
-    if (!fileExists) {
-      return res.send(generateUnlockPage(uuid, encryptedConfig, 'Configuration not found. Please set up a new configuration.'));
-    }
-    
-    try {
-      const password = req.query.password;
-      const config = await loadUserConfig(userId, password);
-      
-      // Unlock config in session and get session token (store password for later use)
-      const sessionToken = unlockConfig(userId, config, password);
-      
-      // Set session cookie
-      res.cookie(SESSION_COOKIE_NAME, sessionToken, {
-        httpOnly: true,
-        secure: process.env.NODE_ENV === 'production',
-        sameSite: 'lax',
-        maxAge: SESSION_TIMEOUT
-      });
-      
-      // Redirect to config page
-      res.redirect(`/stremio/${uuid}/${encryptedConfig}/configure`);
-      return;
-    } catch (error) {
-      if (error.message === 'Incorrect password' || error.message.includes('Decryption failed')) {
-        return res.send(generateUnlockPage(uuid, encryptedConfig, 'Incorrect password. Please try again.'));
-      }
-      console.error('Error unlocking config:', error);
-      return res.send(generateUnlockPage(uuid, encryptedConfig, 'An error occurred while unlocking your configuration.'));
-    }
-  }
+  // Unlock is now handled via POST route - removed GET handler for security
   
   // If config exists, show unlock form
   if (fileExists) {
@@ -3139,6 +3127,59 @@ function renderConfigPage(req, res, userId, uuid, encryptedConfig, currentPrefs)
     </html>
   `);
 }
+
+/**
+ * Handle unlock form submission (POST to avoid password in URL)
+ */
+app.post('/stremio/:uuid/:encryptedConfig/unlock', async (req, res) => {
+  const { uuid, encryptedConfig } = req.params;
+  
+  // Validate UUID format
+  if (!isValidUUID(uuid)) {
+    return res.status(400).send(generateErrorPage(
+      'Invalid Configuration',
+      'The configuration ID is invalid or malformed.'
+    ));
+  }
+  
+  const userId = uuid;
+  const fileExists = await configFileExists(userId);
+  
+  if (!fileExists) {
+    return res.send(generateUnlockPage(uuid, encryptedConfig, 'Configuration not found. Please set up a new configuration.'));
+  }
+  
+  const password = req.body.password;
+  if (!password || password.length === 0) {
+    return res.send(generateUnlockPage(uuid, encryptedConfig, 'Password is required.'));
+  }
+  
+  try {
+    const config = await loadUserConfig(userId, password);
+    
+    // Unlock config in session and get session token
+    // Note: Password is stored temporarily in memory for session duration (30 min) to allow saving without re-entry
+    const sessionToken = unlockConfig(userId, config, password);
+    
+    // Set session cookie
+    res.cookie(SESSION_COOKIE_NAME, sessionToken, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'lax',
+      maxAge: SESSION_TIMEOUT
+    });
+    
+    // Redirect to config page
+    res.redirect(`/stremio/${uuid}/${encryptedConfig}/configure`);
+    return;
+  } catch (error) {
+    if (error.message === 'Incorrect password' || error.message.includes('Decryption failed')) {
+      return res.send(generateUnlockPage(uuid, encryptedConfig, 'Incorrect password. Please try again.'));
+    }
+    console.error('Error unlocking config:', error);
+    return res.send(generateUnlockPage(uuid, encryptedConfig, 'An error occurred while unlocking your configuration.'));
+  }
+});
 
 /**
  * Handle configuration form submission
