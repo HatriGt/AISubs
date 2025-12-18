@@ -1897,6 +1897,16 @@ function renderConfigPage(req, res, userId, uuid, encryptedConfig, currentPrefs)
     { code: 'kn', name: 'Kannada', flag: '🇮🇳' }
   ];
   
+  // Sort languages: selected languages first (maintaining their order), then unselected
+  const sortedLanguages = [...languages].sort((a, b) => {
+    const aSelected = selectedLangs.includes(a.code);
+    const bSelected = selectedLangs.includes(b.code);
+    if (aSelected && !bSelected) return -1;
+    if (!aSelected && bSelected) return 1;
+    // If both selected or both unselected, maintain original order
+    return languages.indexOf(a) - languages.indexOf(b);
+  });
+  
   res.send(`
     <!DOCTYPE html>
     <html lang="en">
@@ -2115,7 +2125,7 @@ function renderConfigPage(req, res, userId, uuid, encryptedConfig, currentPrefs)
                 <!-- Languages Grid -->
                 <div class="mb-6">
                   <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-2.5 max-h-[520px] overflow-y-auto p-1" id="languagesGrid">
-                    ${languages.map(lang => `
+                    ${sortedLanguages.map(lang => `
                       <label 
                         class="group relative flex items-center gap-3 p-3 rounded-lg border transition-all cursor-pointer ${
                           selectedLangs.includes(lang.code) 
@@ -2385,7 +2395,28 @@ function renderConfigPage(req, res, userId, uuid, encryptedConfig, currentPrefs)
       <script>
         const searchInput = document.getElementById('searchInput');
         const selectedCount = document.getElementById('selectedCount');
-        const languageLabels = document.querySelectorAll('label[data-lang]');
+        let languageLabels = document.querySelectorAll('label[data-lang]');
+        
+        function sortLanguagesGrid() {
+          const grid = document.getElementById('languagesGrid');
+          const labels = Array.from(grid.querySelectorAll('label[data-lang]'));
+          
+          // Sort: selected first, then unselected (maintaining order within each group)
+          labels.sort((a, b) => {
+            const aCheckbox = a.querySelector('input[type="checkbox"]');
+            const bCheckbox = b.querySelector('input[type="checkbox"]');
+            const aSelected = aCheckbox.checked;
+            const bSelected = bCheckbox.checked;
+            
+            if (aSelected && !bSelected) return -1;
+            if (!aSelected && bSelected) return 1;
+            // If both selected or both unselected, maintain current order
+            return 0;
+          });
+          
+          // Re-append in sorted order
+          labels.forEach(label => grid.appendChild(label));
+        }
         
         function updateSelection() {
           const checked = document.querySelectorAll('input[name="languages"]:checked').length;
@@ -2423,6 +2454,12 @@ function renderConfigPage(req, res, userId, uuid, encryptedConfig, currentPrefs)
               if (checkmarkSvg) checkmarkSvg.remove();
             }
           });
+          
+          // Re-sort the grid to keep selected languages at top
+          sortLanguagesGrid();
+          
+          // Update the languageLabels reference after sorting
+          languageLabels = document.querySelectorAll('label[data-lang]');
         }
         
         function selectAll() {
@@ -2528,6 +2565,16 @@ function renderConfigPage(req, res, userId, uuid, encryptedConfig, currentPrefs)
     { code: 'ml', name: 'Malayalam', flag: '🇮🇳' },
     { code: 'kn', name: 'Kannada', flag: '🇮🇳' }
   ];
+  
+  // Sort languages: selected languages first (maintaining their order), then unselected
+  const sortedLanguages = [...languages].sort((a, b) => {
+    const aSelected = selectedLangs.includes(a.code);
+    const bSelected = selectedLangs.includes(b.code);
+    if (aSelected && !bSelected) return -1;
+    if (!aSelected && bSelected) return 1;
+    // If both selected or both unselected, maintain original order
+    return languages.indexOf(a) - languages.indexOf(b);
+  });
   
   res.send(`
     <!DOCTYPE html>
@@ -2747,7 +2794,7 @@ function renderConfigPage(req, res, userId, uuid, encryptedConfig, currentPrefs)
                 <!-- Languages Grid -->
                 <div class="mb-6">
                   <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-2.5 max-h-[520px] overflow-y-auto p-1" id="languagesGrid">
-                    ${languages.map(lang => `
+                    ${sortedLanguages.map(lang => `
                       <label 
                         class="group relative flex items-center gap-3 p-3 rounded-lg border transition-all cursor-pointer ${
                           selectedLangs.includes(lang.code) 
@@ -3046,7 +3093,28 @@ function renderConfigPage(req, res, userId, uuid, encryptedConfig, currentPrefs)
       <script>
         const searchInput = document.getElementById('searchInput');
         const selectedCount = document.getElementById('selectedCount');
-        const languageLabels = document.querySelectorAll('label[data-lang]');
+        let languageLabels = document.querySelectorAll('label[data-lang]');
+        
+        function sortLanguagesGrid() {
+          const grid = document.getElementById('languagesGrid');
+          const labels = Array.from(grid.querySelectorAll('label[data-lang]'));
+          
+          // Sort: selected first, then unselected (maintaining order within each group)
+          labels.sort((a, b) => {
+            const aCheckbox = a.querySelector('input[type="checkbox"]');
+            const bCheckbox = b.querySelector('input[type="checkbox"]');
+            const aSelected = aCheckbox.checked;
+            const bSelected = bCheckbox.checked;
+            
+            if (aSelected && !bSelected) return -1;
+            if (!aSelected && bSelected) return 1;
+            // If both selected or both unselected, maintain current order
+            return 0;
+          });
+          
+          // Re-append in sorted order
+          labels.forEach(label => grid.appendChild(label));
+        }
         
         function updateSelection() {
           const checked = document.querySelectorAll('input[name="languages"]:checked').length;
@@ -3084,6 +3152,12 @@ function renderConfigPage(req, res, userId, uuid, encryptedConfig, currentPrefs)
               if (checkmarkSvg) checkmarkSvg.remove();
             }
           });
+          
+          // Re-sort the grid to keep selected languages at top
+          sortLanguagesGrid();
+          
+          // Update the languageLabels reference after sorting
+          languageLabels = document.querySelectorAll('label[data-lang]');
         }
         
         function selectAll() {
