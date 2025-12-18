@@ -13,6 +13,38 @@ const app = express();
 // Trust proxy for correct HTTPS detection on Render and other cloud platforms
 app.set('trust proxy', true);
 
+// Redirect HTTP to HTTPS on Render (before other middleware)
+app.use((req, res, next) => {
+  const host = req.get('host') || '';
+  const isRender = host.includes('onrender.com') || host.includes('render.com');
+  const forwardedProto = req.get('x-forwarded-proto');
+  
+  // Redirect HTTP to HTTPS on Render
+  // Check both the protocol and the forwarded-proto header
+  if (isRender && req.protocol === 'http' && forwardedProto !== 'https') {
+    return res.redirect(301, `https://${host}${req.originalUrl}`);
+  }
+  
+  next();
+});
+
+// Helper function to get the correct base URL with proper protocol detection
+function getBaseUrl(req) {
+  if (process.env.BASE_URL) {
+    return process.env.BASE_URL;
+  }
+  
+  // Detect protocol correctly (works with trust proxy)
+  const protocol = req.protocol || (req.get('x-forwarded-proto') || 'http').split(',')[0].trim();
+  const host = req.get('host') || `127.0.0.1:${process.env.PORT || 7001}`;
+  
+  // Force HTTPS if on Render (onrender.com domain) or if x-forwarded-proto is https
+  const isRender = host.includes('onrender.com') || host.includes('render.com');
+  const finalProtocol = (isRender || protocol === 'https' || req.get('x-forwarded-proto')?.includes('https')) ? 'https' : protocol;
+  
+  return `${finalProtocol}://${host}`;
+}
+
 app.use((req, res, next) => {
   if (req.path.includes('subtitles') || req.path.includes('manifest') || req.path.includes('configure')) {
     console.log(`\n${req.method} ${req.path}`);
@@ -1764,7 +1796,7 @@ app.get('/stremio/:uuid/:encryptedConfig/configure', async (req, res) => {
 function renderConfigPage(req, res, userId, uuid, encryptedConfig, currentPrefs) {
   const selectedLangs = currentPrefs.languages || ['en'];
   const saved = req.query.saved === 'true';
-  const baseUrl = process.env.BASE_URL || `http://${req.get('host')}`;
+  const baseUrl = getBaseUrl(req);
   const manifestUrl = `${baseUrl}/stremio/${uuid}/${encryptedConfig}/manifest.json`;
   
   // Check if config has been saved at least once (has API key or languages configured)
@@ -2436,7 +2468,7 @@ function renderConfigPage(req, res, userId, uuid, encryptedConfig, currentPrefs)
 function renderConfigPage(req, res, userId, uuid, encryptedConfig, currentPrefs) {
   const selectedLangs = currentPrefs.languages || ['en'];
   const saved = req.query.saved === 'true';
-  const baseUrl = process.env.BASE_URL || `http://${req.get('host')}`;
+  const baseUrl = getBaseUrl(req);
   const manifestUrl = `${baseUrl}/stremio/${uuid}/${encryptedConfig}/manifest.json`;
   
   // Check if config has been saved at least once (has API key or languages configured)
@@ -3592,7 +3624,7 @@ const subtitleHandler = async function(args) {
             } catch (translationError) {
               if (translationError.message.includes('API key not configured')) {
                 console.error(`Translation failed: User needs to configure OpenRouter API key`);
-                const baseUrl = process.env.BASE_URL || `http://${req?.get?.('host') || 'localhost:7001'}`;
+                const baseUrl = req ? getBaseUrl(req) : (process.env.BASE_URL || 'http://localhost:7001');
                 console.error(`Visit: ${baseUrl}/configure`);
               } else {
                 console.error(`Error translating to ${lang}:`, translationError.message);
@@ -3643,10 +3675,8 @@ app.get('/stremio/:uuid/:encryptedConfig/manifest.json', async (req, res) => {
   try {
     const { uuid, encryptedConfig } = req.params;
     
-    // Use request host if available, otherwise fall back to BASE_URL or default
-    const protocol = req.protocol || 'http';
-    const host = req.get('host') || `127.0.0.1:${port}`;
-    const baseUrl = process.env.BASE_URL || `${protocol}://${host}`;
+    // Use helper function to get correct base URL with proper protocol detection
+    const baseUrl = getBaseUrl(req);
     const configUrl = `${baseUrl}/stremio/${uuid}/${encryptedConfig}/configure`;
     
     const manifestData = {
