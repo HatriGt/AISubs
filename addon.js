@@ -29,44 +29,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// Security headers middleware
-app.use((req, res, next) => {
-  // Prevent MIME type sniffing
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-  
-  // Prevent clickjacking
-  res.setHeader('X-Frame-Options', 'DENY');
-  
-  // Enable XSS protection (legacy, but still useful)
-  res.setHeader('X-XSS-Protection', '1; mode=block');
-  
-  // Strict Transport Security (HSTS) - force HTTPS for 1 year
-  if (req.secure || req.get('x-forwarded-proto') === 'https') {
-    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
-  }
-  
-  // Content Security Policy - allow same origin and inline scripts/styles for the config page
-  res.setHeader('Content-Security-Policy', 
-    "default-src 'self'; " +
-    "script-src 'self' 'unsafe-inline' 'unsafe-eval'; " +
-    "style-src 'self' 'unsafe-inline'; " +
-    "img-src 'self' data: https:; " +
-    "font-src 'self' data:; " +
-    "connect-src 'self' https://openrouter.ai https://api.openrouter.ai; " +
-    "frame-ancestors 'none';"
-  );
-  
-  // Referrer Policy
-  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
-  
-  // Permissions Policy (formerly Feature-Policy)
-  res.setHeader('Permissions-Policy', 
-    'geolocation=(), microphone=(), camera=(), payment=(), usb=(), magnetometer=(), gyroscope=(), speaker=()'
-  );
-  
-  next();
-});
-
 // Helper function to get the correct base URL with proper protocol detection
 function getBaseUrl(req) {
   if (process.env.BASE_URL) {
