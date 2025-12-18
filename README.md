@@ -31,6 +31,23 @@ cp .env.sample .env
 docker-compose up -d
 ```
 
+### Deploy to Render (Cloud Hosting)
+
+Deploy to [Render](https://render.com) for free cloud hosting with automatic SSL:
+
+1. **Push your code to GitHub/GitLab/Bitbucket**
+2. **Connect to Render:**
+   - Go to [Render Dashboard](https://dashboard.render.com)
+   - Click "New +" → "Blueprint" (or "Web Service")
+   - Connect your repository
+   - Render will auto-detect `render.yaml`
+3. **Set Environment Variables:**
+   - `MASTER_KEY`: Generate with `openssl rand -hex 32`
+   - `PORT` and `BASE_URL` are auto-configured
+4. **Deploy:** Render will build and deploy automatically
+
+📖 **Detailed guide:** See [RENDER_DEPLOYMENT.md](./RENDER_DEPLOYMENT.md)
+
 ### Local Installation
 
 ```bash

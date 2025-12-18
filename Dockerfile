@@ -20,9 +20,9 @@ RUN mkdir -p configs && chmod 700 configs
 # Expose port
 EXPOSE 7001
 
-# Health check
+# Health check (uses PORT env var, defaults to 7001)
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-  CMD node -e "require('http').get('http://localhost:7001/health', (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})"
+  CMD node -e "const port = process.env.PORT || 7001; require('http').get(`http://localhost:${port}/health`, (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})"
 
 # Start the application
 CMD ["bun", "start"]

@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: stremio-ai-subs
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: starter
+    envVars:
+      - key: NODE_ENV
+        value: production
+      # PORT is automatically set by Render
+      # BASE_URL will be constructed from the request (supports HTTPS automatically)
+      # MASTER_KEY must be set manually in Render dashboard (generate with: openssl rand -hex 32)
+    healthCheckPath: /health
+    autoDeploy: true
+
