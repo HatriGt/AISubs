@@ -1356,7 +1356,7 @@ function convertToVTT(content, currentFormat) {
   return content;
 }
 
-async function serveSubtitleContent(content, language, type, id, season, episode) {
+async function serveSubtitleContent(content, language, type, id, season, episode, baseUrl = null) {
   if (!content) {
     return null;
   }
@@ -1365,8 +1365,9 @@ async function serveSubtitleContent(content, language, type, id, season, episode
   
   global.subtitleCache[subtitleId] = content;
   
-  const baseUrl = process.env.BASE_URL || `http://127.0.0.1:${process.env.PORT || 7000}`;
-  return `${baseUrl}/subtitle/${subtitleId}.vtt`;
+  // Use provided baseUrl, or fall back to environment variable or default
+  const finalBaseUrl = baseUrl || process.env.BASE_URL || `http://127.0.0.1:${process.env.PORT || 7000}`;
+  return `${finalBaseUrl}/subtitle/${subtitleId}.vtt`;
 }
 
 // Express Routes
@@ -3468,7 +3469,7 @@ const builder = new addonBuilder({
 let subtitleHandlerFunction = null;
 
 const subtitleHandler = async function(args) {
-  const { type, id, extra, userData } = args;
+  const { type, id, extra, userData, baseUrl } = args;
   const season = extra?.season;
   const episode = extra?.episode;
   
@@ -3550,7 +3551,8 @@ const subtitleHandler = async function(args) {
               type,
               id,
               season,
-              episode
+              episode,
+              baseUrl
             );
             
             if (subtitleUrl) {
@@ -3610,7 +3612,8 @@ const subtitleHandler = async function(args) {
                 type,
                 id,
                 season,
-                episode
+                episode,
+                baseUrl
               );
               
               if (subtitleUrl) {
@@ -3800,12 +3803,16 @@ app.get('/stremio/:uuid/:encryptedConfig/subtitles/:type/:id*.json', async (req,
       episode: extra.episode || episode
     };
     
-    // Create args with userData
+    // Get base URL for subtitle generation
+    const baseUrl = getBaseUrl(req);
+    
+    // Create args with userData and baseUrl
     const args = {
       type,
       id,
       extra: finalExtra,
-      userData: { userId, uuid }
+      userData: { userId, uuid },
+      baseUrl: baseUrl
     };
     
     console.log(`Calling subtitle handler with args:`, JSON.stringify(args, null, 2));
