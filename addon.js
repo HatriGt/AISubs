@@ -697,7 +697,8 @@ async function fetchSubtitleContent(subtitleUrl) {
 }
 
 /**
- * Search and fetch subtitles from wyzie-lib
+ * Search and fetch all subtitles from wyzie-lib for a given language
+ * Returns an array of subtitle objects (or single object if only one found)
  */
 async function getSubtitlesFromWyzie(type, id, season, episode, language) {
   try {
@@ -726,28 +727,37 @@ async function getSubtitlesFromWyzie(type, id, season, episode, language) {
       return null;
     }
     
-    // Get the first matching subtitle
-    const subtitleData = subtitleResults[0];
+    console.log(`Found ${subtitleResults.length} ${language} subtitle(s) in wyzie-lib`);
     
-    if (!subtitleData.url) {
-      console.log(`Subtitle data found but no URL available`);
+    // Fetch all subtitles
+    const allSubtitles = [];
+    for (const subtitleData of subtitleResults) {
+      if (!subtitleData.url) {
+        console.log(`Subtitle data found but no URL available, skipping`);
+        continue;
+      }
+      
+      // Fetch the actual subtitle content from the URL
+      console.log(`Fetching subtitle content from: ${subtitleData.url}`);
+      const subtitleContent = await fetchSubtitleContent(subtitleData.url);
+      
+      if (subtitleContent) {
+        allSubtitles.push({
+          content: subtitleContent,
+          language: subtitleData.language || language,
+          format: subtitleData.type || 'srt',
+          url: subtitleData.url
+        });
+      }
+    }
+    
+    if (allSubtitles.length === 0) {
+      console.log(`No valid ${language} subtitles could be fetched`);
       return null;
     }
     
-    // Fetch the actual subtitle content from the URL
-    console.log(`Fetching subtitle content from: ${subtitleData.url}`);
-    const subtitleContent = await fetchSubtitleContent(subtitleData.url);
-    
-    if (!subtitleContent) {
-      return null;
-    }
-    
-    return {
-      content: subtitleContent,
-      language: subtitleData.language || language,
-      format: subtitleData.type || 'srt',
-      url: subtitleData.url
-    };
+    // Return array if multiple subtitles, or single object for backward compatibility
+    return allSubtitles.length === 1 ? allSubtitles[0] : allSubtitles;
     
   } catch (error) {
     console.error(`Error getting subtitles from wyzie-lib for ${language}:`, error.message);
@@ -851,6 +861,53 @@ function splitSubtitlesByCount(srtContent, chunkSize = 50) {
   }
   
   return chunks;
+}
+
+/**
+ * Split a single chunk further into smaller pieces for retry
+ * Used when a chunk fails after retries - split it and try smaller pieces
+ */
+function splitChunkFurther(chunkContent, maxSplits = 2) {
+  const lines = chunkContent.split('\n');
+  const chunks = [];
+  let currentChunk = [];
+  let currentBlock = [];
+  
+  // Split into smaller chunks (aim for ~200 chars per chunk)
+  const targetCharsPerChunk = Math.max(200, Math.ceil(chunkContent.length / maxSplits));
+  let currentChars = 0;
+  
+  for (const line of lines) {
+    currentBlock.push(line);
+    
+    if (line.trim() === '') {
+      if (currentBlock.length > 1) {
+        const blockText = currentBlock.join('\n');
+        const blockChars = blockText.length;
+        
+        // Check if adding this block would exceed character limit
+        // Don't split in the middle of a subtitle entry (block)
+        if (currentChars + blockChars > targetCharsPerChunk && currentChunk.length > 0) {
+          // Save current chunk and start new one
+          chunks.push(currentChunk.join('\n\n') + '\n');
+          currentChunk = [blockText];
+          currentChars = blockChars;
+        } else {
+          currentChunk.push(blockText);
+          currentChars += blockChars + 2; // +2 for \n\n separator
+        }
+      }
+      currentBlock = [];
+    }
+  }
+  
+  // Add remaining chunk
+  if (currentChunk.length > 0) {
+    chunks.push(currentChunk.join('\n\n') + '\n');
+  }
+  
+  // Return original if can't split (too small or single subtitle entry)
+  return chunks.length > 1 ? chunks : [chunkContent];
 }
 
 // Rate limiter lock for concurrent access
@@ -1198,26 +1255,122 @@ ${chunk}`;
   
   // Store results in correct order and check for errors
   const errors = [];
+  const failedChunks = []; // Track failed chunks for retry
+  
   for (const { index, result, error } of batchResults) {
     if (error) {
       errors.push(`Chunk ${index + 1}: ${error.message}`);
-      // Don't throw immediately - collect all errors first
+      failedChunks.push({ index, chunk: chunks[index], error: error.message });
       translatedChunks[index] = null; // Mark as failed
     } else {
       translatedChunks[index] = result;
     }
   }
   
+  // Retry failed chunks with exponential backoff
+  if (failedChunks.length > 0) {
+    console.log(`  🔄 Retrying ${failedChunks.length} failed chunk(s)...`);
+    
+    for (const { index, chunk, error: originalError } of failedChunks) {
+      const retryAttempts = 3;
+      let retrySuccess = false;
+      
+      for (let retry = 0; retry < retryAttempts && !retrySuccess; retry++) {
+        try {
+          const waitTime = 2000 * Math.pow(2, retry); // Exponential backoff: 2s, 4s, 8s
+          if (retry > 0) {
+            console.log(`  🔄 Retrying chunk ${index + 1} (attempt ${retry + 1}/${retryAttempts}) after ${waitTime/1000}s...`);
+            await new Promise(resolve => setTimeout(resolve, waitTime));
+          } else {
+            console.log(`  🔄 Retrying chunk ${index + 1} immediately...`);
+          }
+          
+          // Try translating the chunk again
+          const retryResult = await translateChunk(chunk, index);
+          translatedChunks[index] = retryResult;
+          retrySuccess = true;
+          console.log(`  ✅ Chunk ${index + 1} succeeded on retry`);
+          
+          // Remove from errors list
+          const errorIndex = errors.findIndex(e => e.startsWith(`Chunk ${index + 1}:`));
+          if (errorIndex >= 0) {
+            errors.splice(errorIndex, 1);
+          }
+        } catch (retryError) {
+          console.log(`  ⚠️  Chunk ${index + 1} retry ${retry + 1} failed: ${retryError.message}`);
+          
+          // If all retries failed, try splitting the chunk
+          if (retry === retryAttempts - 1) {
+            console.log(`  🔪 Splitting chunk ${index + 1} into smaller pieces...`);
+            
+            try {
+              const splitChunks = splitChunkFurther(chunk);
+              
+              if (splitChunks.length > 1) {
+                console.log(`  📦 Split chunk ${index + 1} into ${splitChunks.length} smaller chunk(s)`);
+                
+                // Translate each split chunk
+                const splitResults = [];
+                for (let splitIdx = 0; splitIdx < splitChunks.length; splitIdx++) {
+                  try {
+                    const splitResult = await translateChunk(splitChunks[splitIdx], `${index}.${splitIdx}`);
+                    splitResults.push(splitResult);
+                    console.log(`  ✅ Split chunk ${index + 1}.${splitIdx + 1} translated successfully`);
+                  } catch (splitError) {
+                    console.log(`  ❌ Split chunk ${index + 1}.${splitIdx + 1} failed: ${splitError.message}`);
+                    // Even if one split fails, try to use the others
+                    splitResults.push(null);
+                  }
+                }
+                
+                // Combine successful split results
+                const validSplitResults = splitResults.filter(r => r !== null);
+                if (validSplitResults.length > 0) {
+                  translatedChunks[index] = validSplitResults.join('\n\n');
+                  retrySuccess = true;
+                  console.log(`  ✅ Chunk ${index + 1} succeeded after splitting (${validSplitResults.length}/${splitChunks.length} parts)`);
+                  
+                  // Remove from errors list
+                  const errorIndex = errors.findIndex(e => e.startsWith(`Chunk ${index + 1}:`));
+                  if (errorIndex >= 0) {
+                    errors.splice(errorIndex, 1);
+                  }
+                } else {
+                  console.log(`  ❌ All split chunks for ${index + 1} failed`);
+                }
+              } else {
+                console.log(`  ⚠️  Chunk ${index + 1} cannot be split further (too small or single subtitle entry)`);
+              }
+            } catch (splitError) {
+              console.log(`  ❌ Failed to split chunk ${index + 1}: ${splitError.message}`);
+            }
+          }
+        }
+      }
+    }
+  }
+  
+  // Final check - update errors list with remaining failures
+  const finalErrors = [];
+  for (let i = 0; i < translatedChunks.length; i++) {
+    if (translatedChunks[i] === null) {
+      const originalError = errors.find(e => e.startsWith(`Chunk ${i + 1}:`));
+      if (originalError) {
+        finalErrors.push(originalError);
+      }
+    }
+  }
+  
   // If we have errors, log them but don't fail completely if we have some results
-  if (errors.length > 0) {
-    console.log(`  ⚠️  ${errors.length} chunk(s) failed:`, errors.join(', '));
-    if (errors.length === chunks.length) {
-      throw new Error(`All chunks failed: ${errors.join('; ')}`);
+  if (finalErrors.length > 0) {
+    console.log(`  ⚠️  ${finalErrors.length} chunk(s) failed after retries and splitting:`, finalErrors.join(', '));
+    if (finalErrors.length === chunks.length) {
+      throw new Error(`All chunks failed: ${finalErrors.join('; ')}`);
     }
     // Filter out null results (failed chunks)
     const validChunks = translatedChunks.filter(chunk => chunk !== null);
     if (validChunks.length === 0) {
-      throw new Error(`All chunks failed: ${errors.join('; ')}`);
+      throw new Error(`All chunks failed: ${finalErrors.join('; ')}`);
     }
     console.log(`  ✅ Continuing with ${validChunks.length}/${chunks.length} successful chunks`);
     return validChunks.join('\n\n');
@@ -3516,6 +3669,9 @@ const subtitleHandler = async function(args) {
     const allLanguages = ['en', ...preferredLanguages.filter(lang => lang !== 'en')];
     const subtitles = [];
     
+    // Store the best English subtitle for translation (first one is typically best)
+    let bestEnglishSubtitle = null;
+    
     console.log(`\n🔍 Processing subtitle request for ${type}/${id} (season: ${season}, episode: ${episode})`);
     console.log(`👤 User ID: ${userId}`);
     console.log(`🌐 User preferred languages: ${preferredLanguages.join(', ')}`);
@@ -3526,44 +3682,79 @@ const subtitleHandler = async function(args) {
       try {
         // Step 1: Try to get subtitle from wyzie-lib
         console.log(`Attempting to fetch ${lang} subtitle from wyzie-lib...`);
-        const wyzieSubtitle = await getSubtitlesFromWyzie(type, id, season, episode, lang);
+        const wyzieSubtitles = await getSubtitlesFromWyzie(type, id, season, episode, lang);
         
-        if (wyzieSubtitle && wyzieSubtitle.content) {
-          // Found in wyzie-lib, use it directly
-          console.log(`Found ${lang} subtitle in wyzie-lib`);
+        // Handle both single subtitle (backward compatibility) and array of subtitles
+        const subtitleArray = Array.isArray(wyzieSubtitles) ? wyzieSubtitles : (wyzieSubtitles ? [wyzieSubtitles] : []);
+        
+        if (subtitleArray.length > 0) {
+          // Found in wyzie-lib, process all subtitles
+          console.log(`Found ${subtitleArray.length} ${lang} subtitle(s) in wyzie-lib`);
           
-          // Convert to VTT if needed
-          const vttContent = convertToVTT(wyzieSubtitle.content, wyzieSubtitle.format);
-          
-          if (!vttContent) {
-            console.log(`Failed to convert ${lang} subtitle to VTT`);
-            continue;
+          // Store the first (best) English subtitle for translation
+          if (lang === 'en' && !bestEnglishSubtitle) {
+            bestEnglishSubtitle = subtitleArray[0];
+            console.log(`Stored best English subtitle for translation (using first of ${subtitleArray.length} available)`);
           }
           
-          // Serve the subtitle
-          const subtitleUrl = await serveSubtitleContent(
-            vttContent,
-            lang,
-            type,
-            id,
-            season,
-            episode
-          );
-          
-          if (subtitleUrl) {
-            subtitles.push({
-              id: `${lang}_${id}_${Date.now()}`,
-              url: subtitleUrl,
-              lang: lang,
-              name: `${lang.toUpperCase()} Subtitles`
-            });
+          // Process and return ALL subtitles found for this language
+          for (let i = 0; i < subtitleArray.length; i++) {
+            const wyzieSubtitle = subtitleArray[i];
+            
+            if (!wyzieSubtitle || !wyzieSubtitle.content) {
+              console.log(`Skipping invalid ${lang} subtitle ${i + 1}`);
+              continue;
+            }
+            
+            // Convert to VTT if needed
+            const vttContent = convertToVTT(wyzieSubtitle.content, wyzieSubtitle.format);
+            
+            if (!vttContent) {
+              console.log(`Failed to convert ${lang} subtitle ${i + 1} to VTT`);
+              continue;
+            }
+            
+            // Serve the subtitle
+            const subtitleUrl = await serveSubtitleContent(
+              vttContent,
+              lang,
+              type,
+              id,
+              season,
+              episode
+            );
+            
+            if (subtitleUrl) {
+              // Add index to name if multiple subtitles for same language
+              const subtitleName = subtitleArray.length > 1 
+                ? `${lang.toUpperCase()} Subtitles (${i + 1})`
+                : `${lang.toUpperCase()} Subtitles`;
+              
+              subtitles.push({
+                id: `${lang}_${id}_${Date.now()}_${i}`,
+                url: subtitleUrl,
+                lang: lang,
+                name: subtitleName
+              });
+            }
           }
-        } else if (lang !== 'en') {
-          // Step 2: Not found, try to translate from English
-          console.log(`${lang} subtitle not found, attempting AI translation from English...`);
+        } else {
+          // Step 2: Not found in wyzie-lib, try to translate from English
+          console.log(`${lang} subtitle not found in wyzie-lib, attempting AI translation from English...`);
           
-          // Get English subtitle first
-          const englishSubtitle = await getSubtitlesFromWyzie(type, id, season, episode, 'en');
+          // Use the best English subtitle we already fetched, or fetch it now if not available
+          let englishSubtitle = bestEnglishSubtitle;
+          
+          if (!englishSubtitle) {
+            console.log(`Best English subtitle not cached, fetching now...`);
+            const englishSubtitles = await getSubtitlesFromWyzie(type, id, season, episode, 'en');
+            const englishArray = Array.isArray(englishSubtitles) ? englishSubtitles : (englishSubtitles ? [englishSubtitles] : []);
+            englishSubtitle = englishArray.length > 0 ? englishArray[0] : null;  // Use first (best) one
+            
+            if (englishSubtitle) {
+              bestEnglishSubtitle = englishSubtitle;
+            }
+          }
           
           if (englishSubtitle && englishSubtitle.content) {
             try {
@@ -3611,7 +3802,7 @@ const subtitleHandler = async function(args) {
                 const baseUrl = process.env.BASE_URL || `http://${req?.get?.('host') || 'localhost:7001'}`;
                 console.error(`   Visit: ${baseUrl}/configure`);
               } else {
-              console.error(`Error translating to ${lang}:`, translationError.message);
+                console.error(`Error translating to ${lang}:`, translationError.message);
               }
               // Continue with other languages
             }
