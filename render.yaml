@@ -11,6 +11,13 @@ services:
       # PORT is automatically set by Render
       # BASE_URL will be constructed from the request (supports HTTPS automatically)
       # MASTER_KEY must be set manually in Render dashboard (generate with: openssl rand -hex 32)
+      # DATABASE_URL will be automatically set when you link a PostgreSQL database
     healthCheckPath: /health
     autoDeploy: true
+
+databases:
+  - name: aisubs-db
+    plan: free
+    databaseName: aisubs
+    user: aisubs_user
 

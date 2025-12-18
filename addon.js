@@ -6,6 +6,7 @@ const { v4: uuidv4 } = require('uuid');
 const crypto = require('crypto');
 const fs = require('fs').promises;
 const path = require('path');
+const { Pool } = require('pg');
 require('dotenv').config();
 
 const app = express();
@@ -286,7 +287,59 @@ if (!global.subtitleCache) {
 
 // Configuration Storage
 
-const CONFIG_DIR = path.join(process.cwd(), 'configs');
+// Database configuration
+const pool = process.env.DATABASE_URL ? new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL?.includes('sslmode=require') || process.env.DATABASE_URL?.includes('render.com') 
+    ? { rejectUnauthorized: false } 
+    : false,
+  max: 20,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 2000,
+}) : null;
+
+// Test database connection
+if (pool) {
+  pool.on('error', (err) => {
+    console.error('Unexpected error on idle client', err);
+  });
+}
+
+// Initialize database schema
+async function initDatabase() {
+  if (!pool) {
+    console.warn('DATABASE_URL not set - using file-based storage (configs will not persist on Render)');
+    return false;
+  }
+  
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS user_configs (
+        user_id VARCHAR(255) PRIMARY KEY,
+        password_hash VARCHAR(255) NOT NULL,
+        password_salt VARCHAR(255) NOT NULL,
+        encrypted_config TEXT NOT NULL,
+        encrypted_public_config TEXT NOT NULL,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        version VARCHAR(50) DEFAULT '1.0.0'
+      )
+    `);
+    
+    // Create index for faster lookups
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_user_configs_updated_at 
+      ON user_configs(updated_at)
+    `);
+    
+    console.log('Database schema initialized successfully');
+    return true;
+  } catch (error) {
+    console.error('Error initializing database:', error);
+    return false;
+  }
+}
+
+const CONFIG_DIR = path.join(process.cwd(), 'configs'); // Keep for backward compatibility
 
 const unlockedConfigs = {};
 const SESSION_TIMEOUT = 30 * 60 * 1000;
@@ -376,12 +429,9 @@ function decryptWithMasterKey(encryptedData) {
 }
 
 /**
- * Save user configuration to JSON file (password-protected)
+ * Save user configuration to database or file (password-protected)
  */
 async function saveUserConfig(userId, config, password) {
-  await ensureConfigDir();
-  const configPath = path.join(CONFIG_DIR, `${userId}.json`);
-  
   // Hash password for storage
   const passwordHash = hashPassword(password);
   
@@ -414,8 +464,40 @@ async function saveUserConfig(userId, config, password) {
   };
   
   try {
-    await fs.writeFile(configPath, JSON.stringify(configData, null, 2), 'utf8');
-    await fs.chmod(configPath, 0o600);
+    // Try database first, fall back to file system
+    if (pool) {
+      await pool.query(
+        `INSERT INTO user_configs 
+         (user_id, password_hash, password_salt, encrypted_config, encrypted_public_config, updated_at, version)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         ON CONFLICT (user_id) 
+         DO UPDATE SET 
+           password_hash = EXCLUDED.password_hash,
+           password_salt = EXCLUDED.password_salt,
+           encrypted_config = EXCLUDED.encrypted_config,
+           encrypted_public_config = EXCLUDED.encrypted_public_config,
+           updated_at = EXCLUDED.updated_at,
+           version = EXCLUDED.version`,
+        [
+          userId,
+          configData.passwordHash,
+          configData.passwordSalt,
+          JSON.stringify(configData.encryptedConfig),
+          JSON.stringify(configData.encryptedPublicConfig),
+          configData.updatedAt,
+          configData.version
+        ]
+      );
+      console.log(`Saved configuration to database: ${userId}`);
+    } else {
+      // Fallback to file system
+      await ensureConfigDir();
+      const configPath = path.join(CONFIG_DIR, `${userId}.json`);
+      await fs.writeFile(configPath, JSON.stringify(configData, null, 2), 'utf8');
+      await fs.chmod(configPath, 0o600);
+      console.log(`Saved configuration to file: configs/${userId}.json`);
+    }
+    
     userPreferences[userId] = publicConfig;
     
     return configData;
@@ -427,9 +509,32 @@ async function saveUserConfig(userId, config, password) {
 
 async function loadUserConfig(userId, password) {
   try {
-    const configPath = path.join(CONFIG_DIR, `${userId}.json`);
-    const data = await fs.readFile(configPath, 'utf8');
-    const fileData = JSON.parse(data);
+    let fileData;
+    
+    // Try database first, fall back to file system
+    if (pool) {
+      const result = await pool.query(
+        'SELECT * FROM user_configs WHERE user_id = $1',
+        [userId]
+      );
+      
+      if (result.rows.length === 0) {
+        return null; // Config doesn't exist
+      }
+      
+      const row = result.rows[0];
+      fileData = {
+        passwordHash: row.password_hash,
+        passwordSalt: row.password_salt,
+        encryptedConfig: JSON.parse(row.encrypted_config),
+        encryptedPublicConfig: JSON.parse(row.encrypted_public_config)
+      };
+    } else {
+      // Fallback to file system
+      const configPath = path.join(CONFIG_DIR, `${userId}.json`);
+      const data = await fs.readFile(configPath, 'utf8');
+      fileData = JSON.parse(data);
+    }
     
     if (!verifyPassword(password, fileData.passwordHash, fileData.passwordSalt)) {
       throw new Error('Incorrect password');
@@ -457,9 +562,18 @@ async function loadUserConfig(userId, password) {
 
 async function configFileExists(userId) {
   try {
-    const configPath = path.join(CONFIG_DIR, `${userId}.json`);
-    await fs.access(configPath);
-    return true;
+    if (pool) {
+      const result = await pool.query(
+        'SELECT user_id FROM user_configs WHERE user_id = $1',
+        [userId]
+      );
+      return result.rows.length > 0;
+    } else {
+      // Fallback to file system
+      const configPath = path.join(CONFIG_DIR, `${userId}.json`);
+      await fs.access(configPath);
+      return true;
+    }
   } catch (error) {
     return false;
   }
@@ -467,12 +581,29 @@ async function configFileExists(userId) {
 
 async function loadPublicConfig(userId) {
   try {
-    const configPath = path.join(CONFIG_DIR, `${userId}.json`);
-    const data = await fs.readFile(configPath, 'utf8');
-    const fileData = JSON.parse(data);
+    let encryptedPublicConfig;
     
-    if (fileData.encryptedPublicConfig) {
-      const publicConfig = decryptWithMasterKey(fileData.encryptedPublicConfig);
+    if (pool) {
+      const result = await pool.query(
+        'SELECT encrypted_public_config FROM user_configs WHERE user_id = $1',
+        [userId]
+      );
+      
+      if (result.rows.length === 0) {
+        return null;
+      }
+      
+      encryptedPublicConfig = JSON.parse(result.rows[0].encrypted_public_config);
+    } else {
+      // Fallback to file system
+      const configPath = path.join(CONFIG_DIR, `${userId}.json`);
+      const data = await fs.readFile(configPath, 'utf8');
+      const fileData = JSON.parse(data);
+      encryptedPublicConfig = fileData.encryptedPublicConfig;
+    }
+    
+    if (encryptedPublicConfig) {
+      const publicConfig = decryptWithMasterKey(encryptedPublicConfig);
       return publicConfig;
     }
     
@@ -487,24 +618,50 @@ async function loadPublicConfig(userId) {
 }
 
 async function loadAllConfigs() {
-  await ensureConfigDir();
   try {
-    const files = await fs.readdir(CONFIG_DIR);
-    const configFiles = files.filter(file => file.endsWith('.json'));
-    console.log(`Found ${configFiles.length} configuration file(s) in ${CONFIG_DIR}`);
-    
     let loadedCount = 0;
-    for (const file of configFiles) {
-      const userId = file.replace('.json', '');
-      try {
-        const publicConfig = await loadPublicConfig(userId);
-        if (publicConfig) {
-          userPreferences[userId] = publicConfig;
-          loadedCount++;
-          console.log(`  Loaded config for ${userId} - Languages: ${publicConfig.languages?.join(', ') || 'en'}, API Key: ${publicConfig.openrouter?.apiKey ? 'Configured' : 'Not set'}`);
+    
+    if (pool) {
+      // Load from database
+      const result = await pool.query(
+        'SELECT user_id, encrypted_public_config FROM user_configs ORDER BY updated_at DESC'
+      );
+      
+      console.log(`Found ${result.rows.length} configuration(s) in database`);
+      
+      for (const row of result.rows) {
+        const userId = row.user_id;
+        try {
+          const encryptedPublicConfig = JSON.parse(row.encrypted_public_config);
+          const publicConfig = decryptWithMasterKey(encryptedPublicConfig);
+          if (publicConfig) {
+            userPreferences[userId] = publicConfig;
+            loadedCount++;
+            console.log(`  Loaded config for ${userId} - Languages: ${publicConfig.languages?.join(', ') || 'en'}, API Key: ${publicConfig.openrouter?.apiKey ? 'Configured' : 'Not set'}`);
+          }
+        } catch (error) {
+          console.error(`  Failed to load config for ${userId}:`, error.message);
         }
-      } catch (error) {
-        console.error(`  Failed to load config for ${userId}:`, error.message);
+      }
+    } else {
+      // Fallback to file system
+      await ensureConfigDir();
+      const files = await fs.readdir(CONFIG_DIR);
+      const configFiles = files.filter(file => file.endsWith('.json'));
+      console.log(`Found ${configFiles.length} configuration file(s) in ${CONFIG_DIR}`);
+      
+      for (const file of configFiles) {
+        const userId = file.replace('.json', '');
+        try {
+          const publicConfig = await loadPublicConfig(userId);
+          if (publicConfig) {
+            userPreferences[userId] = publicConfig;
+            loadedCount++;
+            console.log(`  Loaded config for ${userId} - Languages: ${publicConfig.languages?.join(', ') || 'en'}, API Key: ${publicConfig.openrouter?.apiKey ? 'Configured' : 'Not set'}`);
+          }
+        } catch (error) {
+          console.error(`  Failed to load config for ${userId}:`, error.message);
+        }
       }
     }
     
@@ -3408,7 +3565,7 @@ app.post('/stremio/:uuid/:encryptedConfig/configure', async (req, res) => {
       
       userPreferences[userId] = newConfig;
       
-      console.log(`Saved configuration to file: configs/${userId}.json`);
+      console.log(`Configuration saved for ${userId}`);
       console.log(`  Languages: ${languages.join(', ')}`);
       console.log(`  OpenRouter API Key: ${openrouterApiKey ? '***' + openrouterApiKey.slice(-4) : 'Not set'}`);
       
@@ -3871,14 +4028,24 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Initialize configs directory and load config count
+// Initialize database and load configs
 (async () => {
   try {
-    await ensureConfigDir();
+    // Initialize database schema
+    const dbInitialized = await initDatabase();
+    if (!dbInitialized && pool) {
+      console.error('Database initialization failed. Config saving may not work.');
+    }
+    
+    // Load all configs from database or files
     const count = await loadAllConfigs();
-    console.log(`Configuration directory ready: ${CONFIG_DIR}`);
+    if (pool) {
+      console.log(`Database ready: ${count} configuration(s) loaded`);
+    } else {
+      console.log(`Configuration directory ready: ${CONFIG_DIR} - ${count} configuration(s) loaded`);
+    }
   } catch (error) {
-    console.error('Error initializing configs directory:', error);
+    console.error('Error initializing database/configs:', error);
     console.log('Server will continue, but config saving may fail');
   }
 })();
